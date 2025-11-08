@@ -1,6 +1,6 @@
 # 美股財報分析 Pro
 
-以 Node.js + Express 建立的 SEC / Finnhub / OpenRouter 整合服務，輸入股票代號與日期即可回傳最新 10-Q/10-K 摘要、分析師資料、目標價推估與 LLM 投資建議。前端為純靜態頁面（`public/index.html`），後端 API 位於 `/api/analyze`。
+以 Node.js + Express 建立的 SEC / Finnhub / OpenRouter 整合服務，輸入股票代號與日期即可回傳最新財報摘要（支援 10-Q/10-K 及 20-F/6-K）、分析師資料、目標價推估與 LLM 投資建議。前端為純靜態頁面（`public/index.html`），後端 API 位於 `/api/analyze`。
 
 ## 需求
 

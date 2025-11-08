@@ -33,7 +33,7 @@ app.post('/api/analyze', async (req,res)=>{
     const perFiling = [];
     for (const f of filings){
       const mda = await fetchMDA(f.url, UA);
-      perFiling.push({form:f.form, filingDate:f.filingDate, reportDate:f.reportDate, mda});
+      perFiling.push({form:f.form, formLabel:f.formLabel, filingDate:f.filingDate, reportDate:f.reportDate, mda});
     }
 
     // 2) Finnhub 基本資料（獨立錯誤不終止）
@@ -58,7 +58,13 @@ app.post('/api/analyze', async (req,res)=>{
     const payload = {
       company: ticker.toUpperCase(),
       baseline_date: date,
-      sec_filings: perFiling.map(x=>({form:x.form, filingDate:x.filingDate, reportDate:x.reportDate, mda_excerpt: x.mda.slice(0,5000)})),
+      sec_filings: perFiling.map(x=>({
+        form: x.form,
+        form_label: x.formLabel || x.form,
+        filingDate: x.filingDate,
+        reportDate: x.reportDate,
+        mda_excerpt: x.mda.slice(0,5000)
+      })),
       finnhub: { recommendation:finnhub.recommendation, earnings:finnhub.earnings, quote:finnhub.quote, price_target: ptAgg }
     };
     const llm = await analyzeWithLLM(OPEN_KEY, MODEL, payload);
@@ -66,7 +72,7 @@ app.post('/api/analyze', async (req,res)=>{
     res.json({
       input:{ticker:ticker.toUpperCase(), date},
       fetched:{
-        filings: filings.map(f=>({form:f.form, filingDate:f.filingDate, reportDate:f.reportDate, url:f.url})),
+        filings: filings.map(f=>({form:f.form, form_label:f.formLabel || f.form, filingDate:f.filingDate, reportDate:f.reportDate, url:f.url})),
         finnhub_summary:{
           recommendation: Array.isArray(finnhub.recommendation)?finnhub.recommendation[0]:finnhub.recommendation,
           quote: finnhub.quote,

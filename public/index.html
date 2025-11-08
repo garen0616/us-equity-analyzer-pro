@@ -121,7 +121,7 @@ function renderTimeline(perFiling){
     const exp = f.explanation || '（模型目前未提供詳細解釋）';
     const html = `
       <div class="ti">
-        <h4>${f.form || 'Filing'} · <span class="meta">${f.filingDate || ''}</span></h4>
+        <h4>${f.formLabel || f.form || 'Filing'} · <span class="meta">${f.filingDate || ''}</span></h4>
         <div class="meta">報告期間：${f.reportDate || '-'}</div>
         <div class="summary" style="margin-top:6px">${exp}</div>
       </div>
@@ -175,7 +175,15 @@ async function analyze(){
     }
 
     setKPIs(j?.fetched?.finnhub_summary?.quote, j?.fetched?.finnhub_summary?.price_target, j?.analysis?.action?.rating);
-    renderTimeline(j?.analysis?.per_filing);
+    const filingsMeta = j?.fetched?.filings || [];
+    const timelineData = (j?.analysis?.per_filing || []).map((f,i)=>{
+      const meta = filingsMeta[i] || {};
+      return {
+        ...f,
+        formLabel: f.formLabel || f.form_label || meta.form_label || meta.form || f.form
+      };
+    });
+    renderTimeline(timelineData);
     renderConclusion(j?.analysis);
     setStatus('分析完成 ✅', 'done');
   }catch(err){
