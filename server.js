@@ -119,7 +119,7 @@ async function performAnalysis(ticker, date){
     finnhub: { recommendation:finnhub.recommendation, earnings:finnhub.earnings, quote:finnhub.quote, price_target: ptAgg }
   };
   const llmTtlMs = isHistorical ? 30 * 24 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000;
-  const llm = await analyzeWithLLM(OPEN_KEY, MODEL, payload, { cacheTtlMs: llmTtlMs });
+  const llm = await analyzeWithLLM(OPEN_KEY, MODEL, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v1' });
 
   return {
     input:{ticker:upperTicker, date: baselineDate},
