@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>美股財報分析 Pro</title>
+<title>美股個股分析</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
@@ -56,8 +56,8 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
 </head>
 <body>
 <div class="wrap">
-  <h1>美股財報分析 Pro</h1>
-  <p class="muted">輸入股票代號與日期（YYYY-MM-DD）。系統回溯四季 10-Q/10-K，合併分析師資料，輸出五大指標與投資建議。</p>
+  <h1>美股個股分析</h1>
+  <p class="muted">輸入股票代號與日期（YYYY-MM-DD），系統會回溯近四季財報、整合分析師目標價、新聞情緒與體質評分，並輸出投資建議、批次匯出與分析歷程紀錄。</p>
   <div class="card">
     <div class="row">
       <div><label>Ticker</label><input id="t" value="NVDA" placeholder="NVDA"/></div>
@@ -164,6 +164,17 @@ function ensureTargets(pt, current){
   return {hi, lo, mean, cur};
 }
 
+function formatNewsDate(raw){
+  if(!raw) return '';
+  let iso = raw;
+  const match = /^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z$/i.exec(raw);
+  if(match){
+    iso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
+  }
+  const parsed = dayjs(iso);
+  return parsed.isValid() ? parsed.format('YYYY/MM/DD') : '';
+}
+
 function formatPriceMeta(meta){
   if(!meta?.value) return null;
   const map = {
@@ -255,7 +266,7 @@ function renderNews(bundle){
   if(articles.length){
     lines.push('<div style="margin-top:8px"><strong>最新新聞</strong></div>');
     articles.forEach(a=>{
-      const time = a.published_at ? dayjs(a.published_at).format('YYYY/MM/DD') : '';
+      const time = formatNewsDate(a.published_at);
       const title = a.title || '新聞';
       const url = a.url || '#';
       lines.push(`<div class="muted">• ${time} <a href="${url}" target="_blank" rel="noopener">${title}</a></div>`);
