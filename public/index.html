@@ -6,6 +6,7 @@
 <title>美股財報分析 Pro</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
 <style>
 :root{--bg:#0b0e14;--card:#121826;--muted:#94a3b8;--text:#e2e8f0;--accent:#60a5fa;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;}
 *{box-sizing:border-box}
@@ -83,6 +84,7 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
       <div class="kpi"><h3>建議</h3><p id="rating">-</p></div>
       <div class="kpi"><h3>類型</h3><p id="segment">-</p></div>
       <div class="kpi"><h3>個股體質分數</h3><p id="qualityScore">-</p></div>
+      <div class="kpi"><h3>新聞情緒</h3><p id="newsSentiment">-</p></div>
     </div>
   </div>
 
@@ -101,6 +103,17 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
     <h3 style="margin:0 0 8px">個股體質詳解</h3>
     <div id="profileSummary" class="summary muted">尚無資料</div>
     <div id="profileDetail" class="summary" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin:0 0 8px">新聞情緒與摘要</h3>
+    <div id="newsSummary" class="summary muted">尚無新聞</div>
+    <div id="newsArticles" class="summary" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin:0 0 8px">分析紀錄</h3>
+    <div id="historyList" class="summary muted">尚無分析紀錄</div>
   </div>
 
   <div class="card" style="margin-top:16px">
@@ -177,7 +190,7 @@ function formatScore(score){
   return Number.isFinite(num) ? `${num.toFixed(0)}/100` : '-';
 }
 
-function setKPIs(quote, pt, priceMeta, action, profile){
+function setKPIs(quote, pt, priceMeta, action, profile, news){
   const last = toNum(priceMeta?.value ?? quote?.c);
   const targets = ensureTargets(pt, last);
   const priceLabel = last? ('$'+last.toFixed(2)) : '-';
@@ -193,6 +206,7 @@ function setKPIs(quote, pt, priceMeta, action, profile){
   document.getElementById('rating').textContent = ratingDisplay;
   document.getElementById('segment').textContent = formatSegment(profile);
   document.getElementById('qualityScore').textContent = formatScore(profile?.score);
+  newsSentimentEl.textContent = news?.sentiment?.sentiment_label || '-';
 }
 
 function renderTimeline(perFiling){
@@ -219,6 +233,45 @@ function renderConclusion(analysis){
               (act.stop_loss? ` · 止損 $${n(act.stop_loss,0)}`:'');
   document.getElementById('consensus').innerHTML = cons;
   document.getElementById('decision').innerHTML = dec + (act.rationale? `<div class="muted" style="margin-top:6px">${act.rationale}</div>`:'');
+}
+
+function renderNews(bundle){
+  if(!bundle){
+    newsSummaryEl.textContent = '尚無新聞資料';
+    newsArticlesEl.innerHTML = '';
+    return;
+  }
+  const sentiment = bundle.sentiment || {};
+  newsSummaryEl.innerHTML = `<strong>${sentiment.sentiment_label || '中性'}</strong> · ${sentiment.summary || '（尚無摘要）'}`;
+  const events = Array.isArray(sentiment.supporting_events) ? sentiment.supporting_events : [];
+  const articles = Array.isArray(bundle.articles) ? bundle.articles.slice(0,5) : [];
+  const lines = [];
+  if(events.length){
+    lines.push('<div><strong>關鍵事件</strong></div>');
+    events.forEach(ev=>{
+      lines.push(`<div class="muted">• ${ev.title || '事件'}：${ev.reason || ''}</div>`);
+    });
+  }
+  if(articles.length){
+    lines.push('<div style="margin-top:8px"><strong>最新新聞</strong></div>');
+    articles.forEach(a=>{
+      const time = a.published_at ? dayjs(a.published_at).format('YYYY/MM/DD') : '';
+      const title = a.title || '新聞';
+      const url = a.url || '#';
+      lines.push(`<div class="muted">• ${time} <a href="${url}" target="_blank" rel="noopener">${title}</a></div>`);
+    });
+  }
+  newsArticlesEl.innerHTML = lines.join('') || '（尚無可用新聞）';
+}
+
+function renderHistory(){
+  if(!analysisHistory.length){
+    historyListEl.textContent = '尚無分析紀錄';
+    return;
+  }
+  historyListEl.innerHTML = analysisHistory.map(item=>{
+    return `<div style="margin-bottom:10px"><strong>${item.ticker}</strong> · ${item.date} · ${item.model}<br/><span class="muted">${item.summary}</span></div>`;
+  }).join('');
 }
 
 function renderProfile(profile){
@@ -274,9 +327,14 @@ const goBtn = document.getElementById('go');
 const stopBtn = document.getElementById('stop');
 const modelSelect = document.getElementById('model');
 const defaultModel = modelSelect?.value || 'gpt-5';
+const newsSentimentEl = document.getElementById('newsSentiment');
+const newsSummaryEl = document.getElementById('newsSummary');
+const newsArticlesEl = document.getElementById('newsArticles');
+const historyListEl = document.getElementById('historyList');
 const analyzeLabel = goBtn?.textContent || '分析';
 let inFlightController = null;
 let userAborted = false;
+const analysisHistory = [];
 
 function setStatus(text, state='idle'){
   statusEl.textContent = text;
@@ -346,7 +404,8 @@ async function analyze(){
       j?.fetched?.finnhub_summary?.price_target,
       j?.fetched?.finnhub_summary?.price_meta,
       j?.analysis?.action,
-      j?.analysis?.profile
+      j?.analysis?.profile,
+      j?.news
     );
     const filingsMeta = j?.fetched?.filings || [];
     const timelineData = (j?.analysis?.per_filing || []).map((f,i)=>{
@@ -359,6 +418,16 @@ async function analyze(){
     renderTimeline(timelineData);
     renderConclusion(j?.analysis);
     renderProfile(j?.analysis?.profile);
+    renderNews(j?.news);
+    const historySummary = j?.analysis?.consensus_view?.summary || j?.analysis?.action?.rationale || j?.news?.sentiment?.summary || '（尚無摘要）';
+    analysisHistory.unshift({
+      ticker: j?.input?.ticker || ticker,
+      date: j?.input?.date || date,
+      model: j?.analysis_model || model,
+      summary: historySummary
+    });
+    if(analysisHistory.length > 10) analysisHistory.pop();
+    renderHistory();
     setStatus('分析完成 ✅', 'done');
   }catch(err){
     if(err.name === 'AbortError'){

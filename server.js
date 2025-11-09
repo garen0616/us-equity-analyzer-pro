@@ -14,6 +14,7 @@ import { getAggregatedPriceTarget } from './lib/pricetarget.js';
 import { analyzeWithLLM } from './lib/llm.js';
 import { getHistoricalPrice } from './lib/historicalPrice.js';
 import { getCachedAnalysis, saveAnalysisResult } from './lib/analysisStore.js';
+import { buildNewsBundle } from './lib/news.js';
 
 const app = express();
 app.use(express.json());
@@ -141,6 +142,8 @@ async function performAnalysis(ticker, date, opts={}){
     })),
     finnhub: { recommendation:finnhub.recommendation, earnings:finnhub.earnings, quote:finnhub.quote, price_target: ptAgg }
   };
+  const newsBundle = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPEN_KEY, model: llmModel });
+  payload.news = newsBundle;
   const llmTtlMs = analysisTtl;
   const llm = await analyzeWithLLM(OPEN_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v1' });
 
@@ -156,7 +159,8 @@ async function performAnalysis(ticker, date, opts={}){
       }
     },
     analysis: llm,
-    analysis_model: llmModel
+    analysis_model: llmModel,
+    news: newsBundle
   };
   saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: llmModel, result });
   return result;
@@ -242,12 +246,14 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
           llm_target_price: '',
           recommendation: `ERROR: ${outcome.error.message}`,
           segment: '',
-          quality_score: ''
+          quality_score: '',
+          news_sentiment: ''
         };
       }
       const result = outcome.result;
       const summary = result.fetched?.finnhub_summary || {};
       const profile = result.analysis?.profile;
+      const newsSent = result.news?.sentiment;
       return {
         ticker: result.input.ticker,
         date: task.date,
@@ -257,10 +263,11 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
         llm_target_price: result.analysis?.action?.target_price ?? '',
         recommendation: result.analysis?.action?.rating ?? '',
         segment: profile?.segment_label || profile?.segment || '',
-        quality_score: profile?.score ?? ''
+        quality_score: profile?.score ?? '',
+        news_sentiment: newsSent?.sentiment_label || ''
       };
     });
-    const fields = ['ticker','date','model','current_price','analyst_mean_target','llm_target_price','recommendation','segment','quality_score'];
+    const fields = ['ticker','date','model','current_price','analyst_mean_target','llm_target_price','recommendation','segment','quality_score','news_sentiment'];
     const csv = Papa.unparse({
       fields,
       data: rows.map(r=>fields.map(f=>r[f]))
