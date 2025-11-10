@@ -1,6 +1,6 @@
 # 美股個股分析
 
-以 Node.js + Express 建立的 SEC / Finnhub / OpenRouter / FMP 整合服務，輸入股票代號與日期即可回溯近四季財報、整合分析師共識（含 FMP 目標價）、新聞情緒、動能評分與體質打分，並提供 LLM 投資結論。前端為純靜態頁面（`public/index.html`），後端 API 位於 `/api/analyze`。
+以 Node.js + Express 建立的 SEC / Finnhub / OpenAI / FMP 整合服務，輸入股票代號與日期即可回溯近四季財報、整合分析師共識（含 FMP 目標價）、新聞情緒、動能評分與體質打分，並提供 LLM 投資結論。前端為純靜態頁面（`public/index.html`），後端 API 位於 `/api/analyze`。
 
 ## 需求
 
@@ -9,11 +9,10 @@
   - `SEC_USER_AGENT`：SEC 強制要求，可填 `YourApp/1.0 (email@example.com)`
   - `FINNHUB_KEY`：取得推薦 / 財報 / 報價（作為 FMP 失敗時的備援）
   - `FMP_API_KEY`：Financial Modeling Prep Pro，優先提供即時價、歷史價、動能序列與分析師目標價
-  - `OPENROUTER_KEY`：呼叫 LLM（預設模型 `gpt-5`，可自行調整 `OPENROUTER_MODEL` 或前端下拉選擇）
+  - `OPENAI_API_KEY`：呼叫 LLM（預設模型 `gpt-4o-mini`，可用 `OPENAI_MODEL` 覆寫）
 - 推薦 API key：
   - `SEC_API_KEY`：提升 SEC API 速率
   - `ALPHAVANTAGE_KEY`：Price Target / 歷史價第三層備援
-  - `TWELVE_DATA_KEY`：Twelve Data 歷史價格第四層備援
 
 ## 安裝與啟動
 
@@ -22,7 +21,7 @@ git clone https://github.com/garen0616/us-equity-analyzer-pro.git
 cd us-equity-analyzer-pro
 npm install
 
-# 編輯 .env，至少填入 SEC / Finnhub / FMP / OpenRouter 金鑰
+# 編輯 .env，至少填入 SEC / Finnhub / FMP / OpenAI 金鑰
 cp .env.example .env  # 如需範本
 
 # 本地啟動
@@ -48,11 +47,11 @@ curl -s -X POST http://localhost:5000/api/analyze \
 - `price_target.targetMean = 229.67`（AlphaVantage 均價，系統已自動補齊高低區間）
 - `analysis.action.rating = BUY`、`target_price = 225`、`stop_loss = 165`
 
-前端頁面同時會顯示 ChatGPT 總結、財報時間線、體質詳解、動能/趨勢與新聞情緒，可用瀏覽器打開 `http://localhost:5000` 驗證。
+前端頁面同時會顯示 ChatGPT 總結、財報時間線、體質詳解、動能/趨勢與新聞情緒，並在「ChatGPT 總結」卡片下方標示本次 OpenAI token 與估算 cost，方便掌握用量。可用瀏覽器打開 `http://localhost:5000` 驗證。
 
 ## 批次分析（Excel / CSV）
 
-- 前端頁面底部的「批次分析」工作列可直接上傳 Excel/CSV；第一欄 `ticker`、第二欄 `date`（`YYYY-MM-DD`）、第三欄 `model`（可留空採預設）。
+- 前端頁面底部的「批次分析」工作列可直接上傳 Excel/CSV；第一欄 `ticker`、第二欄 `date`（`YYYY-MM-DD`），舊版第三欄 `model` 仍相容但可留空。
 - 伺服器會依序執行與 `/api/analyze` 相同的流程，並輸出 CSV，欄位為：Ticker、Date、Model、現價、分析師平均/共識目標價、ChatGPT 總結目標價、建議、類型（大型/小型股）、體質分數、新聞情緒、動能評分、趨勢燈號。
 - 後端同時提供 `POST /api/batch`，multipart field 名稱為 `file`，可自動取得產出的 CSV。
 
@@ -71,9 +70,8 @@ curl -s -X POST http://localhost:5000/api/analyze \
   - `FINNHUB_KEY=...`
   - `FMP_API_KEY=...`
   - `ALPHAVANTAGE_KEY=...`（如有）
-  - `TWELVE_DATA_KEY=...`（如有）
-   - `OPENROUTER_KEY=...`
-   - `OPENROUTER_MODEL=gpt-5`
+  - `OPENAI_API_KEY=...`
+  - `OPENAI_MODEL=gpt-4o-mini`
 4. 部署完成後，Zeabur 會提供公開 URL，即可透過瀏覽器使用。
 
 ## 有用腳本

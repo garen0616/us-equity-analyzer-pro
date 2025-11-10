@@ -30,26 +30,16 @@ const UA   = process.env.SEC_USER_AGENT || 'App/1.0 (email@example.com)';
 const SEC_KEY = process.env.SEC_API_KEY || '';
 const FH_KEY  = process.env.FINNHUB_KEY || '';
 const AV_KEY  = process.env.ALPHAVANTAGE_KEY || '';
-const TWELVE_KEY = process.env.TWELVE_DATA_KEY || '';
 const FMP_KEY = process.env.FMP_API_KEY || process.env.FMP_KEY || '';
-const OPEN_KEY= process.env.OPENROUTER_KEY || '';
-const MODEL   = process.env.OPENROUTER_MODEL || 'gpt-5';
+const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const BATCH_CONCURRENCY = Math.max(1, Number(process.env.BATCH_CONCURRENCY || 3));
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 10 * 1024 * 1024 } });
 const REALTIME_TTL_MS = 6 * 60 * 60 * 1000;
 const HISTORICAL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const ALLOWED_MODEL_LIST = (process.env.OPENROUTER_ALLOWED_MODELS || 'gpt-5,gpt-4.1,gpt-4o-mini')
-  .split(',')
-  .map(s=>s.trim())
-  .filter(Boolean);
-if(!ALLOWED_MODEL_LIST.includes(MODEL)) ALLOWED_MODEL_LIST.push(MODEL);
-const ALLOWED_MODEL_SET = new Set(ALLOWED_MODEL_LIST);
 
-function resolveModelName(requested){
-  const trimmed = (requested || '').trim();
-  if(!trimmed) return MODEL;
-  if(ALLOWED_MODEL_SET.size === 0) return trimmed;
-  return ALLOWED_MODEL_SET.has(trimmed) ? trimmed : MODEL;
+function resolveModelName(){
+  return OPENAI_MODEL;
 }
 
 function errRes(res, err){ console.error('❌', err); return res.status(500).json({error:String(err.message||err)}); }
@@ -116,7 +106,6 @@ async function performAnalysis(ticker, date, opts={}){
         fmpKey: FMP_KEY,
         finnhubKey: FH_KEY,
         alphaKey: AV_KEY,
-        twelveKey: TWELVE_KEY
       });
       if(hist?.price!=null){
         current = hist.price;
@@ -201,12 +190,13 @@ async function performAnalysis(ticker, date, opts={}){
     })),
     finnhub: { recommendation:finnhub.recommendation, earnings:finnhub.earnings, quote:finnhub.quote, price_target: ptAgg }
   };
-  const newsBundle = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPEN_KEY, model: llmModel });
+  const newsBundle = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPENAI_KEY, model: llmModel });
   payload.news = newsBundle;
   const momentum = await computeMomentumMetrics(upperTicker, baselineDate);
   payload.momentum = momentum;
   const llmTtlMs = analysisTtl;
-  const llm = await analyzeWithLLM(OPEN_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
+  const llm = await analyzeWithLLM(OPENAI_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
+  const llmUsage = llm?.__usage || null;
 
   const result = {
     input:{ticker:upperTicker, date: baselineDate},
@@ -220,6 +210,7 @@ async function performAnalysis(ticker, date, opts={}){
       }
     },
     analysis: llm,
+    llm_usage: llmUsage,
     analysis_model: llmModel,
     news: newsBundle,
     momentum

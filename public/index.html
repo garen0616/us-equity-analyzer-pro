@@ -58,18 +58,11 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
 <body>
 <div class="wrap">
   <h1>美股個股分析</h1>
-  <p class="muted">輸入股票代號、日期與想要使用的 GPT 模型（預設 gpt-5），系統會優先以 FMP 快取現價與歷史價，再結合 SEC 財報、分析師均價、GDELT 新聞情緒、動能/趨勢與體質評分，輸出 ChatGPT 總結、重大重點與批次報表。</p>
+  <p class="muted">輸入股票代號與日期（後端固定使用 OpenAI gpt-4o-mini），系統會優先以 FMP 快取現價與歷史價，再結合 SEC 財報、分析師均價、GDELT 新聞情緒、動能/趨勢與體質評分，輸出 ChatGPT 總結、重大重點與批次報表。</p>
   <div class="card">
     <div class="row">
       <div><label>Ticker</label><input id="t" value="NVDA" placeholder="NVDA"/></div>
       <div><label>Date</label><input id="d" type="date" value="2025-11-08"/></div>
-      <div><label>模型</label>
-        <select id="model">
-          <option value="gpt-5" selected>gpt-5</option>
-          <option value="gpt-4.1">gpt-4.1</option>
-          <option value="gpt-4o-mini">gpt-4o-mini</option>
-        </select>
-      </div>
       <div style="align-self:end"><button id="go">分析</button></div>
       <div style="grid-column:1 / -1">
         <div class="status-row">
@@ -129,7 +122,7 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
   <div class="card" style="margin-top:16px">
     <h3 style="margin:0 0 8px">批次分析</h3>
     <div class="summary muted" style="margin-bottom:12px">
-      利用下方工作列上傳 Excel/CSV（第一欄 ticker、第二欄 date、第三欄 model 可空白），系統會逐行呼叫分析並下載包含現價、分析師平均/共識目標價、ChatGPT 目標價、建議、類型、體質分數、新聞情緒、動能分數與趨勢燈號的 CSV。
+      利用下方工作列上傳 Excel/CSV（第一欄 ticker、第二欄 date，舊版第三欄 model 可留空），系統會逐行呼叫分析並下載包含現價、分析師平均/共識目標價、ChatGPT 目標價、建議、類型、體質分數、新聞情緒、動能分數與趨勢燈號的 CSV。
     </div>
     <div class="summary muted">
       <strong>步驟：</strong><br/>
@@ -183,6 +176,21 @@ function formatNewsDate(raw){
   }
   const parsed = dayjs(iso);
   return parsed.isValid() ? parsed.format('YYYY/MM/DD') : '';
+}
+
+function formatUsageLine(usage){
+  if(!usage) return '';
+  const prompt = usage.prompt_tokens ?? usage.promptTokens;
+  const completion = usage.completion_tokens ?? usage.completionTokens;
+  const totalCost = usage.total_cost ?? usage.totalCost;
+  const tokensLabel = Number.isFinite(prompt) && Number.isFinite(completion)
+    ? `${prompt}+${completion} tokens`
+    : '';
+  const costLabel = Number.isFinite(totalCost)
+    ? `≈ $${Number(totalCost).toFixed(4)}`
+    : '';
+  const parts = [tokensLabel, costLabel].filter(Boolean).join(' ');
+  return parts ? `<div class="muted" style="margin-top:6px">LLM 用量：${parts}</div>` : '';
 }
 
 function formatPriceMeta(meta){
@@ -250,8 +258,7 @@ function collectInputParams(){
   if(dateInput && rawDate && rawDate !== normalizedDate){
     dateInput.value = normalizedDate;
   }
-  const model = (modelSelect?.value || defaultModel).trim() || defaultModel;
-  return { ticker, date: normalizedDate, model };
+  return { ticker, date: normalizedDate };
 }
 
 function setRefreshState(state){
@@ -310,13 +317,15 @@ function renderTimeline(perFiling){
   });
 }
 
-function renderConclusion(analysis){
+function renderConclusion(analysis, usageFallback){
   const cons = analysis?.consensus_view?.summary || '（尚無共識摘要）';
   const act = analysis?.action || {};
   const dec = (act.rating? `<b>${act.rating}</b>`:'-') +
               (act.target_price? ` · 目標價 $${n(act.target_price,0)}`:'') +
               (act.stop_loss? ` · 止損 $${n(act.stop_loss,0)}`:'');
-  document.getElementById('consensus').innerHTML = cons;
+  const usage = analysis?.__usage || usageFallback;
+  const usageLine = formatUsageLine(usage);
+  document.getElementById('consensus').innerHTML = usageLine ? `${cons}${usageLine}` : cons;
   document.getElementById('decision').innerHTML = dec + (act.rationale? `<div class="muted" style="margin-top:6px">${act.rationale}</div>`:'');
 }
 
@@ -384,7 +393,7 @@ function renderHistory(){
     return;
   }
   historyListEl.innerHTML = analysisHistory.map(item=>{
-    return `<div style="margin-bottom:10px"><strong>${item.ticker}</strong> · ${item.date} · ${item.model}<br/><span class="muted">${item.summary}</span></div>`;
+    return `<div style="margin-bottom:10px"><strong>${item.ticker}</strong> · ${item.date}<br/><span class="muted">${item.summary}</span></div>`;
   }).join('');
 }
 
@@ -439,8 +448,6 @@ function renderProfile(profile){
 const statusEl = document.getElementById('status');
 const goBtn = document.getElementById('go');
 const stopBtn = document.getElementById('stop');
-const modelSelect = document.getElementById('model');
-const defaultModel = modelSelect?.value || 'gpt-5';
 const momentumScoreEl = document.getElementById('momentumScore');
 const trendFlagEl = document.getElementById('trendFlag');
 const momentumSummaryEl = document.getElementById('momentumSummary');
@@ -485,9 +492,6 @@ function setAnalyzeRunning(running){
     }
     inFlightController = null;
   }
-  if(modelSelect){
-    modelSelect.disabled = running;
-  }
   if(running){
     setRefreshState('disabled');
   }
@@ -498,7 +502,7 @@ async function analyze(){
     setStatus('已有分析任務執行中，請稍候或按「停止」。', 'running');
     return;
   }
-  const { ticker, date, model } = collectInputParams();
+  const { ticker, date } = collectInputParams();
   if(!ticker || !date){
     setStatus('請先輸入 Ticker 與 Date。', 'error');
     return;
@@ -506,7 +510,7 @@ async function analyze(){
 
   userAborted = false;
   setAnalyzeRunning(true);
-  setStatus(`正在分析 ${ticker}（模型 ${model}），這可能需要 1-2 分鐘，請勿關閉頁面…`, 'running');
+  setStatus(`正在分析 ${ticker}，這可能需要 1-2 分鐘，請勿關閉頁面…`, 'running');
   document.getElementById('out').textContent='分析中...';
 
   const controller = new AbortController();
@@ -516,7 +520,7 @@ async function analyze(){
     const r = await fetch('/api/analyze',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ticker,date,model}),
+      body:JSON.stringify({ticker,date}),
       signal: controller.signal
     });
     const j = await r.json();
@@ -544,7 +548,7 @@ async function analyze(){
       };
     });
     renderTimeline(timelineData);
-    renderConclusion(j?.analysis);
+    renderConclusion(j?.analysis, j?.llm_usage);
     renderProfile(j?.analysis?.profile);
     renderNews(j?.news);
     renderMomentum(j?.momentum);
@@ -555,7 +559,6 @@ async function analyze(){
     analysisHistory.unshift({
       ticker: j?.input?.ticker || ticker,
       date: j?.input?.date || date,
-      model: j?.analysis_model || model,
       summary: historySummary
     });
     if(analysisHistory.length > 10) analysisHistory.pop();
@@ -563,8 +566,7 @@ async function analyze(){
     setStatus('分析完成 ✅', 'done');
     lastCompletedParams = {
       ticker: j?.input?.ticker || ticker,
-      date: j?.input?.date || date,
-      model: j?.analysis_model || model
+      date: j?.input?.date || date
     };
     setRefreshState('enabled');
   }catch(err){
@@ -600,8 +602,8 @@ async function handleRefreshClick(){
     setStatus('尚無可重抓的分析結果，請先完成一次分析。', 'error');
     return;
   }
-  const { ticker, date, model } = collectInputParams();
-  if(ticker !== lastCompletedParams.ticker || date !== lastCompletedParams.date || model !== lastCompletedParams.model){
+  const { ticker, date } = collectInputParams();
+  if(ticker !== lastCompletedParams.ticker || date !== lastCompletedParams.date){
     setStatus('目前輸入與最後一次分析不同，請先重新分析後再重抓。', 'error');
     return;
   }
@@ -611,7 +613,7 @@ async function handleRefreshClick(){
     const resp = await fetch('/api/reset-cache',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ticker, date, model })
+      body: JSON.stringify({ ticker, date })
     });
     const payload = await resp.json().catch(()=> ({}));
     if(!resp.ok || payload?.error){
