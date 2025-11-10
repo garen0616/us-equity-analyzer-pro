@@ -40,7 +40,8 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
 .status-pill[data-state="error"]::before{background:var(--bad)}
 .status-pill[data-state="idle"]::before{background:var(--muted)}
 .status-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;align-items:flex-start}
-.ghost-btn{background:transparent;border:1px solid #334155;color:var(--muted);padding:8px 16px;border-radius:999px;font-size:14px;width:auto;display:none;margin-top:2px}
+.ghost-btn{background:transparent;border:1px solid #334155;color:var(--muted);padding:8px 16px;border-radius:999px;font-size:14px;width:auto;display:inline-flex;align-items:center;justify-content:center;margin-top:2px}
+#stop{display:none}
 .ghost-btn:hover{border-color:#475569;color:#e2e8f0}
 .batch-running{display:none;align-items:center;gap:8px;color:#bfdbfe;font-size:14px}
 .batch-dot{width:12px;height:12px;border-radius:50%;background:#60a5fa;animation:pulse-ball .8s ease-in-out infinite}
@@ -192,12 +193,25 @@ function formatPriceMeta(meta){
     'finnhub_candle':'歷史收盤（Finnhub）',
     'alphavantage_daily':'歷史收盤（AlphaVantage）',
     'yahoo_chart':'歷史收盤（Yahoo）',
+    'yahoo_quote':'即時價（Yahoo）',
     'real-time':'即時價',
     'real-time_fallback':'即時價（備援）'
   };
   const label = map[meta.source] || (meta.kind === 'historical' ? '歷史收盤' : '即時價');
   const dateLabel = meta.as_of ? ` ${meta.as_of}` : '';
   return `${label}${dateLabel}`;
+}
+
+function formatPriceTargetSource(pt){
+  if(!pt) return '';
+  if(pt.source === 'unavailable' || pt.error){
+    return '未取得';
+  }
+  const map = {
+    'fmp':'FMP',
+    'yahoo':'Yahoo Finance'
+  };
+  return map[pt.source] || (pt.source || '');
 }
 
 function formatSegment(profile){
@@ -257,7 +271,15 @@ function setKPIs(quote, pt, priceMeta, action, profile, news, momentum){
   const priceLabel = last? ('$'+last.toFixed(2)) : '-';
   const metaLabel = formatPriceMeta(priceMeta);
   document.getElementById('px').textContent = metaLabel ? `${priceLabel}（${metaLabel}）` : priceLabel;
-  document.getElementById('ptMean').textContent = targets.mean? ('$'+targets.mean.toFixed(2)) : '-';
+  const ptSourceLabel = formatPriceTargetSource(pt);
+  const ptMeanValue = targets.mean? ('$'+targets.mean.toFixed(2)) : '-';
+  let ptMeanDisplay = ptMeanValue;
+  if(ptSourceLabel === '未取得'){
+    ptMeanDisplay = '未取得';
+  }else if(ptSourceLabel){
+    ptMeanDisplay = `${ptMeanValue}（${ptSourceLabel}）`;
+  }
+  document.getElementById('ptMean').textContent = ptMeanDisplay;
   const llmTarget = toNum(action?.target_price);
   document.getElementById('ptRange').textContent = llmTarget? ('$'+llmTarget.toFixed(0)) : '-';
   const ratingRaw = typeof action?.rating==='string' ? action.rating : '';

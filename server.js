@@ -17,6 +17,7 @@ import { getCachedAnalysis, saveAnalysisResult, deleteAnalysis } from './lib/ana
 import { buildNewsBundle } from './lib/news.js';
 import { computeMomentumMetrics } from './lib/momentum.js';
 import { getFmpQuote } from './lib/fmp.js';
+import { getYahooQuote } from './lib/yahoo.js';
 import { clearCacheForTicker } from './lib/cache.js';
 
 const app = express();
@@ -136,9 +137,13 @@ async function performAnalysis(ticker, date, opts={}){
         if(quote.asOf) priceMeta.as_of = quote.asOf;
       }catch(err){ console.warn('[FMP Quote]', err.message); }
     }
-    if(current==null && finnhub?.quote?.c!=null){
-      current = finnhub.quote.c;
-      priceMeta.source = 'finnhub_quote';
+    if(current==null){
+      try{
+        const yahoo = await getYahooQuote(upperTicker);
+        current = yahoo.price;
+        priceMeta.source = yahoo.source;
+        if(yahoo.asOf) priceMeta.as_of = yahoo.asOf;
+      }catch(err){ console.warn('[Yahoo Quote]', err.message); }
     }
     if(current==null){
       priceMeta.source = 'real-time_fallback';
@@ -155,10 +160,14 @@ async function performAnalysis(ticker, date, opts={}){
       priceMeta.kind = 'real-time';
     }catch(err){ console.warn('[FMP Quote fallback]', err.message); }
   }
-  if(current==null && finnhub?.quote?.c!=null){
-    current = finnhub.quote.c;
-    priceMeta.source = 'finnhub_quote';
-    priceMeta.kind = 'real-time';
+  if(current==null){
+    try{
+      const yahoo = await getYahooQuote(upperTicker);
+      current = yahoo.price;
+      priceMeta.source = yahoo.source;
+      priceMeta.as_of = yahoo.asOf || priceMeta.as_of;
+      priceMeta.kind = 'real-time';
+    }catch(err){ console.warn('[Yahoo Quote fallback]', err.message); }
   }
 
   priceMeta.value = current;
@@ -167,8 +176,18 @@ async function performAnalysis(ticker, date, opts={}){
   finnhub.price_meta = priceMeta;
 
   let ptAgg;
-  try{ ptAgg = await getAggregatedPriceTarget(upperTicker, FH_KEY, AV_KEY, current, FMP_KEY); }
-  catch(e){ ptAgg = { error:e.message }; }
+  try{
+    ptAgg = await getAggregatedPriceTarget(upperTicker, FH_KEY, AV_KEY, current, FMP_KEY);
+  }catch(e){
+    ptAgg = {
+      source:'unavailable',
+      error:e.message,
+      targetHigh:null,
+      targetLow:null,
+      targetMean:null,
+      targetMedian:null
+    };
+  }
 
   const payload = {
       company: upperTicker,
