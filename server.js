@@ -13,10 +13,11 @@ import { getRecommendations, getEarnings, getQuote } from './lib/finnhub.js';
 import { getAggregatedPriceTarget } from './lib/pricetarget.js';
 import { analyzeWithLLM } from './lib/llm.js';
 import { getHistoricalPrice } from './lib/historicalPrice.js';
-import { getCachedAnalysis, saveAnalysisResult } from './lib/analysisStore.js';
+import { getCachedAnalysis, saveAnalysisResult, deleteAnalysis } from './lib/analysisStore.js';
 import { buildNewsBundle } from './lib/news.js';
 import { computeMomentumMetrics } from './lib/momentum.js';
 import { getFmpQuote } from './lib/fmp.js';
+import { clearCacheForTicker } from './lib/cache.js';
 
 const app = express();
 app.use(express.json());
@@ -257,6 +258,21 @@ app.post('/api/analyze', async (req,res)=>{
     const result = await performAnalysis(ticker, date, { model: resolvedModel });
     res.json(result);
   }catch(err){ return errRes(res, err); }
+});
+
+app.post('/api/reset-cache', async (req,res)=>{
+  const { ticker, date, model } = req.body || {};
+  if(!ticker || !date) return res.status(400).json({ error:'ticker and date required' });
+  const normalizedDate = normalizeDate(date);
+  if(!normalizedDate || !dayjs(normalizedDate).isValid()){
+    return res.status(400).json({ error:'invalid date' });
+  }
+  const upperTicker = ticker.toUpperCase();
+  const resolvedModel = resolveModelName(model);
+  deleteAnalysis({ ticker: upperTicker, baselineDate: normalizedDate, model: resolvedModel });
+  const clearedExact = clearCacheForTicker({ ticker: upperTicker, baselineDate: normalizedDate });
+  const clearedAll = clearCacheForTicker({ ticker: upperTicker, includeAllDates: true });
+  res.json({ ok:true, cleared_cache_files: clearedExact + clearedAll });
 });
 
 app.post('/api/batch', upload.single('file'), async (req,res)=>{

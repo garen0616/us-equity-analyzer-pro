@@ -74,6 +74,7 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
         <div class="status-row">
           <div id="status" class="status-pill" data-state="idle">待命中，請輸入條件後開始分析。</div>
           <button id="stop" class="ghost-btn">停止</button>
+          <button id="refreshCache" class="ghost-btn" disabled>重新抓取</button>
         </div>
       </div>
     </div>
@@ -224,6 +225,30 @@ function normalizeInputDate(raw){
   const alt = dayjs(new Date(raw));
   if(alt.isValid()) return alt.format('YYYY-MM-DD');
   return replaced;
+}
+
+function collectInputParams(){
+  const tickerInput = document.getElementById('t');
+  const dateInput = document.getElementById('d');
+  const ticker = (tickerInput?.value || '').trim().toUpperCase();
+  const rawDate = (dateInput?.value || '').trim();
+  const normalizedDate = normalizeInputDate(rawDate);
+  if(dateInput && rawDate && rawDate !== normalizedDate){
+    dateInput.value = normalizedDate;
+  }
+  const model = (modelSelect?.value || defaultModel).trim() || defaultModel;
+  return { ticker, date: normalizedDate, model };
+}
+
+function setRefreshState(state){
+  if(!refreshBtn) return;
+  if(state === 'busy'){
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '重抓中...';
+    return;
+  }
+  refreshBtn.textContent = refreshLabel;
+  refreshBtn.disabled = state !== 'enabled';
 }
 
 function setKPIs(quote, pt, priceMeta, action, profile, news, momentum){
@@ -402,14 +427,18 @@ const newsSentimentEl = document.getElementById('newsSentiment');
 const newsSummaryEl = document.getElementById('newsSummary');
 const newsArticlesEl = document.getElementById('newsArticles');
 const historyListEl = document.getElementById('historyList');
+const refreshBtn = document.getElementById('refreshCache');
+const refreshLabel = refreshBtn?.textContent || '重新抓取';
 const analyzeLabel = goBtn?.textContent || '分析';
 let inFlightController = null;
 let userAborted = false;
 const analysisHistory = [];
+let lastCompletedParams = null;
 
 renderNews(null);
 renderMomentum(null);
 renderHistory();
+setRefreshState('disabled');
 
 function setStatus(text, state='idle'){
   statusEl.textContent = text;
@@ -437,6 +466,9 @@ function setAnalyzeRunning(running){
   if(modelSelect){
     modelSelect.disabled = running;
   }
+  if(running){
+    setRefreshState('disabled');
+  }
 }
 
 async function analyze(){
@@ -444,14 +476,7 @@ async function analyze(){
     setStatus('已有分析任務執行中，請稍候或按「停止」。', 'running');
     return;
   }
-  const ticker = document.getElementById('t').value.trim().toUpperCase();
-  const dateInput = document.getElementById('d');
-  const rawDate = dateInput.value.trim();
-  const date   = normalizeInputDate(rawDate);
-  if(rawDate && date !== rawDate && dateInput){
-    dateInput.value = date;
-  }
-  const model  = (modelSelect?.value || defaultModel).trim() || defaultModel;
+  const { ticker, date, model } = collectInputParams();
   if(!ticker || !date){
     setStatus('請先輸入 Ticker 與 Date。', 'error');
     return;
@@ -514,6 +539,12 @@ async function analyze(){
     if(analysisHistory.length > 10) analysisHistory.pop();
     renderHistory();
     setStatus('分析完成 ✅', 'done');
+    lastCompletedParams = {
+      ticker: j?.input?.ticker || ticker,
+      date: j?.input?.date || date,
+      model: j?.analysis_model || model
+    };
+    setRefreshState('enabled');
   }catch(err){
     if(err.name === 'AbortError'){
       const msg = userAborted ? '用戶終止，請重新開始分析。' : '分析已中止，請稍後再試。';
@@ -524,6 +555,7 @@ async function analyze(){
     }
   }finally{
     setAnalyzeRunning(false);
+    setRefreshState(lastCompletedParams ? 'enabled' : 'disabled');
   }
 }
 
@@ -535,6 +567,44 @@ if(stopBtn){
     stopBtn.disabled = true;
     inFlightController.abort();
   });
+}
+
+async function handleRefreshClick(){
+  if(inFlightController){
+    setStatus('分析進行中，請先等待完成或停止。', 'running');
+    return;
+  }
+  if(!lastCompletedParams){
+    setStatus('尚無可重抓的分析結果，請先完成一次分析。', 'error');
+    return;
+  }
+  const { ticker, date, model } = collectInputParams();
+  if(ticker !== lastCompletedParams.ticker || date !== lastCompletedParams.date || model !== lastCompletedParams.model){
+    setStatus('目前輸入與最後一次分析不同，請先重新分析後再重抓。', 'error');
+    return;
+  }
+  setRefreshState('busy');
+  setStatus(`正在清除 ${ticker}（${date}）快取，請稍候…`, 'running');
+  try{
+    const resp = await fetch('/api/reset-cache',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ticker, date, model })
+    });
+    const payload = await resp.json().catch(()=> ({}));
+    if(!resp.ok || payload?.error){
+      throw new Error(payload?.error || `HTTP ${resp.status}`);
+    }
+    setStatus('快取已清除，重新分析中…', 'running');
+    await analyze();
+  }catch(err){
+    setStatus(`重新抓取失敗：${err.message}`, 'error');
+    setRefreshState(lastCompletedParams ? 'enabled' : 'disabled');
+  }
+}
+
+if(refreshBtn){
+  refreshBtn.addEventListener('click', handleRefreshClick);
 }
 
 const batchFile = document.getElementById('batchFile');
