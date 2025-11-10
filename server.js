@@ -19,6 +19,7 @@ import { computeMomentumMetrics } from './lib/momentum.js';
 import { getFmpQuote } from './lib/fmp.js';
 import { getYahooQuote } from './lib/yahoo.js';
 import { clearCacheForTicker } from './lib/cache.js';
+import { summarizeMda } from './lib/mdaSummarizer.js';
 
 const app = express();
 app.use(express.json());
@@ -33,6 +34,7 @@ const AV_KEY  = process.env.ALPHAVANTAGE_KEY || '';
 const FMP_KEY = process.env.FMP_API_KEY || process.env.FMP_KEY || '';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5';
+const OPENAI_SECONDARY_MODEL = process.env.OPENAI_MODEL_SECONDARY || 'gpt-4o-mini';
 const BATCH_CONCURRENCY = Math.max(1, Number(process.env.BATCH_CONCURRENCY || 3));
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 10 * 1024 * 1024 } });
 const REALTIME_TTL_MS = 6 * 60 * 60 * 1000;
@@ -40,6 +42,111 @@ const HISTORICAL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 function resolveModelName(){
   return OPENAI_MODEL;
+}
+
+function resolveSecondaryModel(){
+  return OPENAI_SECONDARY_MODEL;
+}
+
+function compactRecommendation(reco){
+  if(!Array.isArray(reco) || !reco.length) return null;
+  const latest = reco.find(r=>r?.period) || reco[0];
+  if(!latest) return null;
+  const keepFields = ['buy','hold','sell','strongBuy','strongSell'];
+  const snapshot = { period: latest.period };
+  for(const field of keepFields){
+    if(latest[field]!=null) snapshot[field] = latest[field];
+  }
+  if(latest.total && snapshot.total==null) snapshot.total = latest.total;
+  return snapshot;
+}
+
+function compactEarningsRows(rows, limit=4){
+  if(!Array.isArray(rows)) return [];
+  return rows
+    .slice(0, limit)
+    .map(r=>({
+      period: r.period,
+      actual: r.actual,
+      estimate: r.estimate,
+      surprise: r.surprise,
+      surprisePercent: r.surprisePercent,
+      revenue: r.revenue,
+      revenueEstimated: r.revenueEstimated
+    }));
+}
+
+function compactQuote(quote){
+  if(!quote) return null;
+  return {
+    c: quote.c ?? null,
+    h: quote.h ?? null,
+    l: quote.l ?? null,
+    o: quote.o ?? null,
+    pc: quote.pc ?? null
+  };
+}
+
+function round(val, digits=4){
+  if(typeof val !== 'number' || Number.isNaN(val)) return null;
+  const factor = 10 ** digits;
+  return Math.round(val * factor) / factor;
+}
+
+function compactMomentum(momentum){
+  if(!momentum) return null;
+  return {
+    score: momentum.score,
+    trend: momentum.trend,
+    reference_date: momentum.reference_date,
+    returns: momentum.returns ? {
+      m3: round(momentum.returns.m3,4),
+      m6: round(momentum.returns.m6,4),
+      m12: round(momentum.returns.m12,4)
+    } : null,
+    moving_averages: momentum.moving_averages ? {
+      ma20: round(momentum.moving_averages.ma20,2),
+      ma50: round(momentum.moving_averages.ma50,2),
+      ma200: round(momentum.moving_averages.ma200,2)
+    } : null,
+    rsi14: round(momentum.rsi14,2),
+    atr14: round(momentum.atr14,2),
+    volume_ratio: round(momentum.volume_ratio,2),
+    price: round(momentum.price,2),
+    price_vs_ma: momentum.price_vs_ma,
+    etf: momentum.etf ? {
+      symbol: momentum.etf.symbol,
+      return3m: round(momentum.etf.return3m,4)
+    } : null
+  };
+}
+
+function compactArticles(articles, limit=5){
+  if(!Array.isArray(articles)) return [];
+  return articles.slice(0, limit).map(a=>({
+    title: a.title,
+    summary: a.summary,
+    url: a.url,
+    published_at: a.published_at,
+    source: a.source,
+    tags: a.tags,
+    tone: a.tone
+  }));
+}
+
+function compactNewsBundle(bundle){
+  if(!bundle) return null;
+  return {
+    keywords: Array.isArray(bundle.keywords) ? bundle.keywords.slice(0,5) : [],
+    articles: compactArticles(bundle.articles, 5),
+    sentiment: bundle.sentiment ? {
+      sentiment_label: bundle.sentiment.sentiment_label,
+      summary: bundle.sentiment.summary,
+      supporting_events: Array.isArray(bundle.sentiment.supporting_events)
+        ? bundle.sentiment.supporting_events.slice(0,3)
+        : []
+    } : null
+  };
 }
 
 function errRes(res, err){ console.error('❌', err); return res.status(500).json({error:String(err.message||err)}); }
@@ -68,6 +175,7 @@ async function performAnalysis(ticker, date, opts={}){
   const isHistorical = parsedDate.isBefore(dayjs(), 'day');
   const analysisTtl = isHistorical ? HISTORICAL_TTL_MS : REALTIME_TTL_MS;
   const llmModel = resolveModelName(opts.model);
+  const secondaryModel = resolveSecondaryModel();
 
   const cachedResult = getCachedAnalysis({ ticker: upperTicker, baselineDate, ttlMs: analysisTtl, model: llmModel });
   if(cachedResult){
@@ -78,7 +186,20 @@ async function performAnalysis(ticker, date, opts={}){
   const filings = await getRecentFilings(cik, baselineDate, UA, SEC_KEY);
   const perFiling = await mapWithConcurrency(filings, 3, async (f)=>{
     const mda = await fetchMDA(f.url, UA);
-    return { form:f.form, formLabel:f.formLabel, filingDate:f.filingDate, reportDate:f.reportDate, mda };
+    let summary = mda.slice(0, 1200);
+    try{
+      summary = await summarizeMda({ text: mda, openKey: OPENAI_KEY, model: secondaryModel, meta:{ ticker: upperTicker, form: f.form } });
+    }catch(err){
+      console.warn('[MDA Summary]', err.message);
+    }
+    return {
+      form:f.form,
+      formLabel:f.formLabel,
+      filingDate:f.filingDate,
+      reportDate:f.reportDate,
+      mda_summary: summary,
+      mda_excerpt: mda.slice(0,1500)
+    };
   });
 
   const cacheContext = baselineDate;
@@ -178,21 +299,37 @@ async function performAnalysis(ticker, date, opts={}){
     };
   }
 
-  const payload = {
-      company: upperTicker,
-      baseline_date: baselineDate,
-      sec_filings: perFiling.map(x=>({
-        form: x.form,
-        form_label: x.formLabel || x.form,
-        filingDate: x.filingDate,
-        reportDate: x.reportDate,
-      mda_excerpt: x.mda.slice(0,5000)
-    })),
-    finnhub: { recommendation:finnhub.recommendation, earnings:finnhub.earnings, quote:finnhub.quote, price_target: ptAgg }
+  const finnhubSnapshot = {
+    recommendation: Array.isArray(finnhub.recommendation)
+      ? compactRecommendation(finnhub.recommendation)
+      : (finnhub.recommendation?.error ? { error: finnhub.recommendation.error } : null),
+    earnings: Array.isArray(finnhub.earnings)
+      ? compactEarningsRows(finnhub.earnings)
+      : (finnhub.earnings?.error ? { error: finnhub.earnings.error } : []),
+    quote: compactQuote(finnhub.quote),
+    price_target: ptAgg,
+    price_meta: priceMeta
   };
-  const newsBundle = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPENAI_KEY, model: llmModel });
-  payload.news = newsBundle;
-  const momentum = await computeMomentumMetrics(upperTicker, baselineDate);
+
+  const payload = {
+    company: upperTicker,
+    baseline_date: baselineDate,
+    sec_filings: perFiling.map(x=>({
+      form: x.form,
+      form_label: x.formLabel || x.form,
+      filingDate: x.filingDate,
+      reportDate: x.reportDate,
+      mda_summary: x.mda_summary,
+      mda_excerpt: x.mda_excerpt
+    })),
+    finnhub: finnhubSnapshot
+  };
+
+  const newsRaw = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPENAI_KEY, model: secondaryModel });
+  const newsCompact = compactNewsBundle(newsRaw);
+  payload.news = newsCompact;
+  const momentumRaw = await computeMomentumMetrics(upperTicker, baselineDate);
+  const momentum = compactMomentum(momentumRaw);
   payload.momentum = momentum;
   const llmTtlMs = analysisTtl;
   const llm = await analyzeWithLLM(OPENAI_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
@@ -202,17 +339,12 @@ async function performAnalysis(ticker, date, opts={}){
     input:{ticker:upperTicker, date: baselineDate},
     fetched:{
       filings: filings.map(f=>({form:f.form, form_label:f.formLabel || f.form, filingDate:f.filingDate, reportDate:f.reportDate, url:f.url})),
-      finnhub_summary:{
-        recommendation: Array.isArray(finnhub.recommendation)?finnhub.recommendation[0]:finnhub.recommendation,
-        quote: finnhub.quote,
-        price_target: ptAgg,
-        price_meta: priceMeta
-      }
+      finnhub_summary: finnhubSnapshot
     },
     analysis: llm,
     llm_usage: llmUsage,
     analysis_model: llmModel,
-    news: newsBundle,
+    news: newsCompact,
     momentum
   };
   saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: llmModel, result });

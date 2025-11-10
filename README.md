@@ -9,7 +9,7 @@
   - `SEC_USER_AGENT`：SEC 強制要求，可填 `YourApp/1.0 (email@example.com)`
   - `FINNHUB_KEY`：取得推薦 / 財報 / 報價（作為 FMP 失敗時的備援）
   - `FMP_API_KEY`：Financial Modeling Prep Pro，優先提供即時價、歷史價、動能序列與分析師目標價
-  - `OPENAI_API_KEY`：呼叫 LLM（預設模型 `gpt-5`，可用 `OPENAI_MODEL` 覆寫）
+  - `OPENAI_API_KEY`：呼叫 LLM（預設模型 `gpt-5`，可用 `OPENAI_MODEL` 覆寫；前置摘要/新聞任務可透過 `OPENAI_MODEL_SECONDARY` 指定較小模型，預設 `gpt-4o-mini`）
 - 推薦 API key：
   - `SEC_API_KEY`：提升 SEC API 速率
   - `ALPHAVANTAGE_KEY`：Price Target / 歷史價第三層備援
@@ -47,7 +47,7 @@ curl -s -X POST http://localhost:5000/api/analyze \
 - `price_target.targetMean = 229.67`（AlphaVantage 均價，系統已自動補齊高低區間）
 - `analysis.action.rating = BUY`、`target_price = 225`、`stop_loss = 165`
 
-前端頁面同時會顯示 ChatGPT 總結、財報時間線、體質詳解、動能/趨勢與新聞情緒，並在「ChatGPT 總結」卡片下方標示本次 OpenAI token 與估算 cost，方便掌握用量。可用瀏覽器打開 `http://localhost:5000` 驗證。
+前端頁面同時會顯示 ChatGPT 總結、財報時間線、體質詳解、動能/趨勢與新聞情緒，並在「ChatGPT 總結」卡片下方標示本次 OpenAI token 與估算 cost。SEC MD&A、新聞與分析師/FMP 資料都會先由較小模型進行摘要與欄位萃取，再交給 gpt-5 減少 Token 使用。可用瀏覽器打開 `http://localhost:5000` 驗證。
 
 ## 批次分析（Excel / CSV）
 
@@ -72,6 +72,7 @@ curl -s -X POST http://localhost:5000/api/analyze \
   - `ALPHAVANTAGE_KEY=...`（如有）
   - `OPENAI_API_KEY=...`
   - `OPENAI_MODEL=gpt-5`
+  - `OPENAI_MODEL_SECONDARY=gpt-4o-mini`
 4. 部署完成後，Zeabur 會提供公開 URL，即可透過瀏覽器使用。
 
 ## 有用腳本
