@@ -22,7 +22,7 @@ input[type="date"]::-webkit-calendar-picker-indicator{filter:invert(1);}
 option{background:#0f172a;color:var(--text);}
 button{cursor:pointer;background:linear-gradient(135deg,#2563eb,#06b6d4);border:none}
 button:disabled{opacity:.6;cursor:not-allowed}
-.row{display:grid;grid-template-columns:repeat(3,1fr) 150px;gap:12px}
+.row{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr)) 150px;gap:12px}
 .muted{color:var(--muted)}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px}
 .kpi{background:#0f172a;border:1px solid #1f2937;border-radius:12px;padding:12px}
@@ -58,11 +58,27 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
 <body>
 <div class="wrap">
   <h1>美股個股分析</h1>
-  <p class="muted">輸入股票代號與日期（後端固定使用 OpenAI gpt-5），系統會優先以 FMP 快取現價與歷史價，再結合 SEC 財報、分析師均價、GDELT 新聞情緒、動能/趨勢與體質評分，輸出 ChatGPT 總結、重大重點與批次報表。</p>
+  <p class="muted">輸入股票代號與日期（預設使用 OpenAI gpt-5，可切換為快速/僅快取模式），系統會優先以 FMP 快取現價與歷史價，再結合 SEC 財報、分析師均價、GDELT 新聞情緒、動能/趨勢與體質評分，輸出 ChatGPT 總結、重大重點與批次報表。</p>
   <div class="card">
     <div class="row">
       <div><label>Ticker</label><input id="t" value="NVDA" placeholder="NVDA"/></div>
       <div><label>Date</label><input id="d" type="date" value="2025-11-08"/></div>
+      <div>
+        <label>LLM 模型</label>
+        <select id="model">
+          <option value="auto">自動（建議）</option>
+          <option value="gpt-5">gpt-5（完整）</option>
+          <option value="gpt-4o-mini">gpt-4o-mini（快速/省成本）</option>
+        </select>
+      </div>
+      <div>
+        <label>模式</label>
+        <select id="mode">
+          <option value="full">完整分析</option>
+          <option value="cached-only">僅快取（無快取則返回錯誤）</option>
+          <option value="metrics-only">只整合資料（不呼叫 LLM）</option>
+        </select>
+      </div>
       <div style="align-self:end"><button id="go">分析</button></div>
       <div style="grid-column:1 / -1">
         <div class="status-row">
@@ -130,8 +146,16 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
       2. 上傳後工作列會變成跑動球並顯示「批次分析中」。<br/>
       3. 完成後自動觸發下載，並可在 JSON 區查看完整結果。
     </div>
-    <div class="batch-card-action" style="margin-top:12px;display:flex;gap:12px;align-items:center">
+    <div class="batch-card-action" style="margin-top:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
       <input type="file" id="batchFile" accept=".xlsx,.xls,.csv" hidden>
+      <div style="flex:1;min-width:220px;max-width:280px">
+        <label class="muted" style="font-size:13px;display:block;margin-bottom:4px">批次模式</label>
+        <select id="batchMode">
+          <option value="full">完整分析（含 LLM）</option>
+          <option value="cached-only">僅使用現有快取</option>
+          <option value="metrics-only">只輸出原始資料（無 LLM）</option>
+        </select>
+      </div>
       <button id="batchCardBtn">選擇 Excel</button>
       <div id="batchRunning" class="batch-running">
         <div class="batch-dot"></div>
@@ -150,6 +174,26 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
 function clamp(x){ return Math.max(0, Math.min(1, x)); }
 function n(x, d=2){ const v=Number(x); return Number.isFinite(v)? v.toFixed(d):'-'; }
 function toNum(x){ const v=Number(x); return Number.isFinite(v)? v:null; }
+const SAFE_URL_RE = /^https?:\/\//i;
+
+function safeUrl(url){
+  return SAFE_URL_RE.test(url || '') ? url : '#';
+}
+
+function clearChildren(el){
+  if(!el) return;
+  while(el.firstChild){
+    el.removeChild(el.firstChild);
+  }
+}
+
+function appendLine(el, text, className){
+  if(!el || !text) return;
+  const div = document.createElement('div');
+  if(className) div.className = className;
+  div.textContent = text;
+  el.appendChild(div);
+}
 
 function ensureTargets(pt, current){
   let hi = toNum(pt?.targetHigh), lo = toNum(pt?.targetLow), mean = toNum(pt?.targetMean ?? pt?.targetMedian);
@@ -189,8 +233,7 @@ function formatUsageLine(usage){
   const costLabel = Number.isFinite(totalCost)
     ? `≈ $${Number(totalCost).toFixed(4)}`
     : '';
-  const parts = [tokensLabel, costLabel].filter(Boolean).join(' ');
-  return parts ? `<div class="muted" style="margin-top:6px">LLM 用量：${parts}</div>` : '';
+  return [tokensLabel, costLabel].filter(Boolean).join(' ');
 }
 
 function formatPriceMeta(meta){
@@ -258,7 +301,11 @@ function collectInputParams(){
   if(dateInput && rawDate && rawDate !== normalizedDate){
     dateInput.value = normalizedDate;
   }
-  return { ticker, date: normalizedDate };
+  const modelSelect = document.getElementById('model');
+  const modeSelect = document.getElementById('mode');
+  const model = (modelSelect?.value || 'auto').trim();
+  const mode = (modeSelect?.value || 'full').trim();
+  return { ticker, date: normalizedDate, model, mode };
 }
 
 function setRefreshState(state){
@@ -303,36 +350,70 @@ function setKPIs(quote, pt, priceMeta, action, profile, news, momentum){
 
 function renderTimeline(perFiling){
   const box = document.getElementById('timeline');
-  box.innerHTML='';
-  (perFiling||[]).forEach((f,i)=>{
-    const exp = f.explanation || '（模型目前未提供詳細解釋）';
-    const html = `
-      <div class="ti">
-        <h4>${f.formLabel || f.form || 'Filing'} · <span class="meta">${f.filingDate || ''}</span></h4>
-        <div class="meta">報告期間：${f.reportDate || '-'}</div>
-        <div class="summary" style="margin-top:6px">${exp}</div>
-      </div>
-    `;
-    box.insertAdjacentHTML('beforeend', html);
+  clearChildren(box);
+  const items = Array.isArray(perFiling) ? perFiling : [];
+  if(!items.length){
+    appendLine(box, '尚無資料', 'muted');
+    return;
+  }
+  items.forEach((f)=>{
+    const wrap = document.createElement('div');
+    wrap.className = 'ti';
+    const title = document.createElement('h4');
+    const label = f.formLabel || f.form || 'Filing';
+    const metaSpan = document.createElement('span');
+    metaSpan.className = 'meta';
+    metaSpan.textContent = f.filingDate || '';
+    title.textContent = `${label} · `;
+    title.appendChild(metaSpan);
+    wrap.appendChild(title);
+    const metaLine = document.createElement('div');
+    metaLine.className = 'meta';
+    metaLine.textContent = `報告期間：${f.reportDate || '-'}`;
+    wrap.appendChild(metaLine);
+    const summary = document.createElement('div');
+    summary.className = 'summary';
+    summary.style.marginTop = '6px';
+    summary.textContent = f.explanation || '（模型目前未提供詳細解釋）';
+    wrap.appendChild(summary);
+    box.appendChild(wrap);
   });
 }
 
 function renderConclusion(analysis, usageFallback){
   const cons = analysis?.consensus_view?.summary || '（尚無共識摘要）';
   const act = analysis?.action || {};
-  const dec = (act.rating? `<b>${act.rating}</b>`:'-') +
-              (act.target_price? ` · 目標價 $${n(act.target_price,0)}`:'') +
-              (act.stop_loss? ` · 止損 $${n(act.stop_loss,0)}`:'');
   const usage = analysis?.__usage || usageFallback;
   const usageLine = formatUsageLine(usage);
-  document.getElementById('consensus').innerHTML = usageLine ? `${cons}${usageLine}` : cons;
-  document.getElementById('decision').innerHTML = dec + (act.rationale? `<div class="muted" style="margin-top:6px">${act.rationale}</div>`:'');
+  const consensusEl = document.getElementById('consensus');
+  const decisionEl = document.getElementById('decision');
+  clearChildren(consensusEl);
+  clearChildren(decisionEl);
+  appendLine(consensusEl, cons);
+  if(usageLine){
+    appendLine(consensusEl, `LLM 用量：${usageLine}`, 'muted');
+  }
+  const ratingMap = { BUY:'買進', HOLD:'觀望', SELL:'賣出' };
+  const ratingRaw = typeof act.rating==='string' ? act.rating : '';
+  const ratingKey = ratingRaw ? ratingRaw.toUpperCase() : '';
+  const ratingDisplay = ratingMap[ratingKey] || ratingRaw || '-';
+  const llmTarget = toNum(act.target_price);
+  const stopLoss = toNum(act.stop_loss);
+  const parts = [];
+  if(ratingDisplay && ratingDisplay !== '-') parts.push(ratingDisplay);
+  if(llmTarget!=null) parts.push(`目標價 $${llmTarget.toFixed(0)}`);
+  if(stopLoss!=null) parts.push(`止損 $${stopLoss.toFixed(0)}`);
+  appendLine(decisionEl, parts.length ? parts.join(' · ') : '尚無建議');
+  if(act.rationale){
+    appendLine(decisionEl, act.rationale, 'muted');
+  }
 }
 
 function renderMomentum(momentum){
+  clearChildren(momentumSummaryEl);
+  clearChildren(momentumDetailEl);
   if(!momentum){
-    momentumSummaryEl.textContent = '尚無動能資料';
-    momentumDetailEl.textContent = '';
+    appendLine(momentumSummaryEl, '尚無動能資料', 'muted');
     return;
   }
   const scoreText = toNum(momentum.score)!=null ? `${Math.round(momentum.score)}` : '-';
@@ -349,60 +430,83 @@ function renderMomentum(momentum){
   if(momentum.moving_averages?.ma50) maNotes.push(`MA50 ${momentum.moving_averages.ma50.toFixed(2)}`);
   if(momentum.moving_averages?.ma200) maNotes.push(`MA200 ${momentum.moving_averages.ma200.toFixed(2)}`);
   const maLine = maNotes.join(' ｜ ') || '均線資料不足';
-  momentumSummaryEl.innerHTML = `<strong>${trendText}</strong> · 動能評分 ${scoreText} ｜ 3M ${ret3}`;
-  momentumDetailEl.innerHTML = [
-    `<div class="muted">6M ${ret6} ｜ 12M ${ret12}</div>`,
-    `<div class="muted">RSI14 ${rsi} ｜ ATR14 ${atr} ｜ 量能比 (5/30) ${volRatio}</div>`,
-    `<div class="muted">${maLine}</div>`,
-    `<div class="muted">ETF 參考：${etfLine}</div>`
-  ].join('<br/>');
+  appendLine(momentumSummaryEl, `${trendText} · 動能評分 ${scoreText} ｜ 3M ${ret3}`);
+  appendLine(momentumDetailEl, `6M ${ret6} ｜ 12M ${ret12}`, 'muted');
+  appendLine(momentumDetailEl, `RSI14 ${rsi} ｜ ATR14 ${atr} ｜ 量能比 (5/30) ${volRatio}`, 'muted');
+  appendLine(momentumDetailEl, maLine, 'muted');
+  appendLine(momentumDetailEl, `ETF 參考：${etfLine}`, 'muted');
 }
 
 function renderNews(bundle){
+  clearChildren(newsSummaryEl);
+  clearChildren(newsArticlesEl);
   if(!bundle){
-    newsSummaryEl.textContent = '尚無新聞資料';
-    newsArticlesEl.innerHTML = '';
+    appendLine(newsSummaryEl, '尚無新聞', 'muted');
     return;
   }
   const sentiment = bundle.sentiment || {};
-  newsSummaryEl.innerHTML = `<strong>${sentiment.sentiment_label || '中性'}</strong> · ${sentiment.summary || '（尚無摘要）'}`;
+  const summaryText = `${sentiment.sentiment_label || '中性'} · ${sentiment.summary || '（尚無摘要）'}`;
+  appendLine(newsSummaryEl, summaryText);
   const events = Array.isArray(sentiment.supporting_events) ? sentiment.supporting_events : [];
-  const articles = Array.isArray(bundle.articles) ? bundle.articles.slice(0,5) : [];
-  const lines = [];
+  const articles = Array.isArray(bundle.articles) ? bundle.articles : [];
   if(events.length){
-    lines.push('<div><strong>關鍵事件</strong></div>');
+    appendLine(newsArticlesEl, '關鍵事件', '');
     events.forEach(ev=>{
-      lines.push(`<div class="muted">• ${ev.title || '事件'}：${ev.reason || ''}</div>`);
+      appendLine(newsArticlesEl, `• ${ev.title || '事件'}：${ev.reason || ''}`, 'muted');
     });
   }
   if(articles.length){
-    lines.push('<div style="margin-top:8px"><strong>最新新聞</strong></div>');
+    appendLine(newsArticlesEl, '最新新聞', '');
     articles.forEach(a=>{
+      const line = document.createElement('div');
+      line.className = 'muted';
       const time = formatNewsDate(a.published_at);
       const title = a.title || '新聞';
-      const url = a.url || '#';
-      lines.push(`<div class="muted">• ${time} <a href="${url}" target="_blank" rel="noopener">${title}</a></div>`);
+      const link = document.createElement('a');
+      link.href = safeUrl(a.url);
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = title;
+      line.textContent = `• ${time ? `${time} ` : ''}`;
+      line.appendChild(link);
+      newsArticlesEl.appendChild(line);
     });
   }
-  newsArticlesEl.innerHTML = lines.join('') || '（尚無可用新聞）';
+  if(!events.length && !articles.length){
+    appendLine(newsArticlesEl, '（尚無可用新聞）', 'muted');
+  }
 }
 
 function renderHistory(){
+  clearChildren(historyListEl);
   if(!analysisHistory.length){
-    historyListEl.textContent = '尚無分析紀錄';
+    appendLine(historyListEl, '尚無分析紀錄', 'muted');
     return;
   }
-  historyListEl.innerHTML = analysisHistory.map(item=>{
-    return `<div style="margin-bottom:10px"><strong>${item.ticker}</strong> · ${item.date}<br/><span class="muted">${item.summary}</span></div>`;
-  }).join('');
+  analysisHistory.forEach(item=>{
+    const wrap = document.createElement('div');
+    wrap.style.marginBottom = '10px';
+    const title = document.createElement('div');
+    const strong = document.createElement('strong');
+    strong.textContent = item.ticker;
+    title.appendChild(strong);
+    title.appendChild(document.createTextNode(` · ${item.date}`));
+    wrap.appendChild(title);
+    const summary = document.createElement('div');
+    summary.className = 'muted';
+    summary.textContent = item.summary;
+    wrap.appendChild(summary);
+    historyListEl.appendChild(wrap);
+  });
 }
 
 function renderProfile(profile){
   const summaryEl = document.getElementById('profileSummary');
   const detailEl = document.getElementById('profileDetail');
+  clearChildren(summaryEl);
+  clearChildren(detailEl);
   if(!profile){
-    summaryEl.textContent = '尚無資料';
-    detailEl.textContent = '';
+    appendLine(summaryEl, '尚無資料', 'muted');
     return;
   }
   const filtersMet = profile.filters?.met ?? profile.filters_met;
@@ -415,34 +519,32 @@ function renderProfile(profile){
     : '';
   const segmentLine = formatSegment(profile);
   const headline = [segmentLine, filterLine, scoreLine].filter(Boolean).join(' ｜ ');
-  const summaryText = profile.summary || profile.score_summary || profile.notes || '（模型尚未提供詳解）';
-  summaryEl.innerHTML = `${headline? `<strong>${headline}</strong><br/>`:''}${summaryText}`;
+  if(headline) appendLine(summaryEl, headline);
+  appendLine(summaryEl, profile.summary || profile.score_summary || profile.notes || '（模型尚未提供詳解）');
 
-  const details = [];
   const filterItems = profile.filters?.items || profile.filter_details;
   if(Array.isArray(filterItems) && filterItems.length){
-    const list = filterItems.map(item=>{
+    appendLine(detailEl, '硬性過濾', '');
+    filterItems.forEach(item=>{
       const passed = item.met ?? item.pass ?? false;
       const tag = passed ? '✅' : '⚠️';
-      return `${tag} ${item.name || item.label || '條件'}：${item.reason || item.detail || ''}`;
-    }).join('<br/>');
-    details.push(`<div><strong>硬性過濾</strong><br/>${list}</div>`);
+      appendLine(detailEl, `${tag} ${item.name || item.label || '條件'}：${item.reason || item.detail || ''}`, 'muted');
+    });
   }
   const scoreDetails = profile.score_detail || profile.score_breakdown;
   if(Array.isArray(scoreDetails) && scoreDetails.length){
-    const list = scoreDetails.map(item=>{
+    appendLine(detailEl, '打分拆解', '');
+    scoreDetails.forEach(item=>{
       const pts = toNum(item.points ?? item.score);
-      const ptsLabel = Number.isFinite(pts)? `${pts.toFixed(0)}分` : '';
-      return `• ${(item.category || item.name || '').trim()} ${ptsLabel? `(${ptsLabel})`:''}：${item.reason || item.note || ''}`;
-    }).join('<br/>');
-    details.push(`<div style="margin-top:8px"><strong>打分拆解</strong><br/>${list}</div>`);
+      const ptsLabel = Number.isFinite(pts)? `(${pts.toFixed(0)}分)` : '';
+      appendLine(detailEl, `• ${(item.category || item.name || '').trim()} ${ptsLabel}：${item.reason || item.note || ''}`, 'muted');
+    });
   }
   const catalysts = profile.catalysts;
   if(Array.isArray(catalysts) && catalysts.length){
-    const list = catalysts.map(c=>`• ${c}`).join('<br/>');
-    details.push(`<div style="margin-top:8px"><strong>催化重點</strong><br/>${list}</div>`);
+    appendLine(detailEl, '催化重點', '');
+    catalysts.forEach(c=> appendLine(detailEl, `• ${c}`, 'muted'));
   }
-  detailEl.innerHTML = details.join('<br/><br/>');
 }
 
 const statusEl = document.getElementById('status');
@@ -459,6 +561,9 @@ const historyListEl = document.getElementById('historyList');
 const refreshBtn = document.getElementById('refreshCache');
 const refreshLabel = refreshBtn?.textContent || '重新抓取';
 const analyzeLabel = goBtn?.textContent || '分析';
+const modelSelect = document.getElementById('model');
+const modeSelect = document.getElementById('mode');
+const batchModeSelect = document.getElementById('batchMode');
 let inFlightController = null;
 let userAborted = false;
 const analysisHistory = [];
@@ -495,6 +600,8 @@ function setAnalyzeRunning(running){
   if(running){
     setRefreshState('disabled');
   }
+  if(modelSelect) modelSelect.disabled = running;
+  if(modeSelect) modeSelect.disabled = running;
 }
 
 async function analyze(){
@@ -502,7 +609,7 @@ async function analyze(){
     setStatus('已有分析任務執行中，請稍候或按「停止」。', 'running');
     return;
   }
-  const { ticker, date } = collectInputParams();
+  const { ticker, date, model, mode } = collectInputParams();
   if(!ticker || !date){
     setStatus('請先輸入 Ticker 與 Date。', 'error');
     return;
@@ -520,13 +627,14 @@ async function analyze(){
     const r = await fetch('/api/analyze',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({ticker,date}),
+      body:JSON.stringify({ ticker, date, analysis_model: model, mode }),
       signal: controller.signal
     });
-    const j = await r.json();
+    const j = await r.json().catch(()=> ({}));
     document.getElementById('out').textContent = JSON.stringify(j,null,2);
-    if(j.error){
-      setStatus(`分析失敗：${j.error}`, 'error');
+    if(!r.ok || j.error){
+      const message = j?.error || (r.status === 409 ? '快取模式下找不到既有結果' : `HTTP ${r.status}`);
+      setStatus(`分析失敗：${message}`, 'error');
       return;
     }
 
@@ -540,10 +648,14 @@ async function analyze(){
       j?.momentum
     );
     const filingsMeta = j?.fetched?.filings || [];
-    const timelineData = (j?.analysis?.per_filing || []).map((f,i)=>{
+    const rawTimeline = (j?.analysis?.per_filing && j.analysis.per_filing.length)
+      ? j.analysis.per_filing
+      : (j?.inputs?.sec_filings || []);
+    const timelineData = rawTimeline.map((f,i)=>{
       const meta = filingsMeta[i] || {};
       return {
         ...f,
+        explanation: f.explanation || f.mda_summary || f.mda_excerpt,
         formLabel: f.formLabel || f.form_label || meta.form_label || meta.form || f.form
       };
     });
@@ -566,7 +678,9 @@ async function analyze(){
     setStatus('分析完成 ✅', 'done');
     lastCompletedParams = {
       ticker: j?.input?.ticker || ticker,
-      date: j?.input?.date || date
+      date: j?.input?.date || date,
+      model,
+      mode
     };
     setRefreshState('enabled');
   }catch(err){
@@ -602,7 +716,7 @@ async function handleRefreshClick(){
     setStatus('尚無可重抓的分析結果，請先完成一次分析。', 'error');
     return;
   }
-  const { ticker, date } = collectInputParams();
+  const { ticker, date, model } = collectInputParams();
   if(ticker !== lastCompletedParams.ticker || date !== lastCompletedParams.date){
     setStatus('目前輸入與最後一次分析不同，請先重新分析後再重抓。', 'error');
     return;
@@ -613,7 +727,7 @@ async function handleRefreshClick(){
     const resp = await fetch('/api/reset-cache',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ticker, date })
+      body: JSON.stringify({ ticker, date, analysis_model: model })
     });
     const payload = await resp.json().catch(()=> ({}));
     if(!resp.ok || payload?.error){
@@ -652,7 +766,9 @@ async function handleBatchUpload(file){
   try{
     const fd = new FormData();
     fd.append('file', file);
-    const res = await fetch('/api/batch',{ method:'POST', body: fd });
+    const batchMode = batchModeSelect?.value || 'full';
+    const qs = new URLSearchParams({ mode: batchMode });
+    const res = await fetch(`/api/batch?${qs.toString()}`,{ method:'POST', body: fd });
     if(!res.ok){
       const text = await res.text();
       throw new Error(text || '批次分析失敗');

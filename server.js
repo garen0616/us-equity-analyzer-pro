@@ -36,16 +36,51 @@ const FMP_KEY = process.env.FMP_API_KEY || process.env.FMP_KEY || '';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5';
 const OPENAI_SECONDARY_MODEL = process.env.OPENAI_MODEL_SECONDARY || 'gpt-4o-mini';
+const PRIMARY_MODEL_ALLOWLIST = new Set();
+(process.env.OPENAI_MODEL_ALLOWLIST || `${OPENAI_MODEL},${OPENAI_SECONDARY_MODEL}`)
+  .split(',')
+  .map(v=>v.trim())
+  .filter(Boolean)
+  .forEach(val=>{
+    PRIMARY_MODEL_ALLOWLIST.add(val);
+    PRIMARY_MODEL_ALLOWLIST.add(val.toUpperCase());
+    PRIMARY_MODEL_ALLOWLIST.add(val.toLowerCase());
+  });
 const BATCH_CONCURRENCY = Math.max(1, Number(process.env.BATCH_CONCURRENCY || 3));
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 10 * 1024 * 1024 } });
-const REALTIME_TTL_MS = 6 * 60 * 60 * 1000;
-const HISTORICAL_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const REALTIME_RESULT_TTL_MS = Number(process.env.REALTIME_RESULT_TTL_HOURS || 12) * 60 * 60 * 1000;
+const HISTORICAL_RESULT_TTL_MS = Number(process.env.HISTORICAL_RESULT_TTL_DAYS || 120) * DAY_MS;
 const FILING_SUMMARY_TTL_MS = 180 * DAY_MS;
 const RETRY_ATTEMPTS = Number(process.env.API_RETRY_ATTEMPTS || 3);
 const RETRY_DELAY_MS = Number(process.env.API_RETRY_DELAY_MS || 1500);
+const NEWS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MOMENTUM_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const MAX_FILINGS_FOR_LLM = Math.max(1, Number(process.env.MAX_FILINGS_FOR_LLM || 2));
+const NEWS_ARTICLE_LIMIT = Math.max(1, Number(process.env.NEWS_ARTICLE_LIMIT || 4));
+const NEWS_EVENT_LIMIT = Math.max(1, Number(process.env.NEWS_EVENT_LIMIT || 3));
+const NEWS_KEYWORD_LIMIT = Math.max(1, Number(process.env.NEWS_KEYWORD_LIMIT || 3));
 
-function resolveModelName(){
+function resolveModelName(requested, opts={}){
+  const preferSecondary = Boolean(opts.preferSecondary);
+  const raw = typeof requested === 'string' ? requested.trim() : '';
+  const lc = raw.toLowerCase();
+  if(lc === 'auto' || raw === ''){
+    return preferSecondary ? OPENAI_SECONDARY_MODEL : OPENAI_MODEL;
+  }
+  if(lc === 'secondary' || lc === 'fast'){
+    return OPENAI_SECONDARY_MODEL;
+  }
+  if(PRIMARY_MODEL_ALLOWLIST.has(raw)){
+    return raw;
+  }
+  if(PRIMARY_MODEL_ALLOWLIST.has(raw.toUpperCase())){
+    return raw.toUpperCase();
+  }
+  if(PRIMARY_MODEL_ALLOWLIST.has(raw.toLowerCase())){
+    return raw.toLowerCase();
+  }
+  if(preferSecondary) return OPENAI_SECONDARY_MODEL;
   return OPENAI_MODEL;
 }
 
@@ -67,6 +102,12 @@ function newsCompactCacheKey(ticker, baselineDate, model){
 
 function momentumCacheKey(ticker, baselineDate){
   return `momentum_compact_${ticker}_${baselineDate}`;
+}
+
+function resolveBatchConcurrency(mode){
+  if(mode === 'metrics-only') return Math.max(1, Math.min(2, BATCH_CONCURRENCY));
+  if(mode === 'cached-only') return Math.max(1, Math.floor(BATCH_CONCURRENCY / 2) || 1);
+  return BATCH_CONCURRENCY;
 }
 
 function sleep(ms){
@@ -203,6 +244,21 @@ function compactNewsBundle(bundle){
   };
 }
 
+function trimNewsForPayload(bundle){
+  if(!bundle) return null;
+  return {
+    keywords: Array.isArray(bundle.keywords) ? bundle.keywords.slice(0, NEWS_KEYWORD_LIMIT) : [],
+    articles: compactArticles(bundle.articles, NEWS_ARTICLE_LIMIT),
+    sentiment: bundle.sentiment ? {
+      sentiment_label: bundle.sentiment.sentiment_label,
+      summary: bundle.sentiment.summary,
+      supporting_events: Array.isArray(bundle.sentiment.supporting_events)
+        ? bundle.sentiment.supporting_events.slice(0, NEWS_EVENT_LIMIT)
+        : []
+    } : null
+  };
+}
+
 function errRes(res, err){ console.error('❌', err); return res.status(500).json({error:String(err.message||err)}); }
 
 async function mapWithConcurrency(items, limit, mapper){
@@ -222,24 +278,47 @@ async function mapWithConcurrency(items, limit, mapper){
 }
 
 async function performAnalysis(ticker, date, opts={}){
+  const {
+    preferCacheOnly=false,
+    skipLlm=false,
+    model,
+    llmCacheTtlMs,
+    preferSecondary=false
+  } = opts;
   const parsedDate = dayjs(date);
   if(!parsedDate.isValid()) throw new Error('invalid date format');
   const baselineDate = parsedDate.format('YYYY-MM-DD');
   const upperTicker = ticker.toUpperCase();
   const isHistorical = parsedDate.isBefore(dayjs(), 'day');
-  const analysisTtl = isHistorical ? HISTORICAL_TTL_MS : REALTIME_TTL_MS;
-  const llmModel = resolveModelName(opts.model);
+  const analysisTtl = isHistorical ? HISTORICAL_RESULT_TTL_MS : REALTIME_RESULT_TTL_MS;
+  const llmModel = resolveModelName(model, { preferSecondary });
   const secondaryModel = resolveSecondaryModel();
+  const effectiveLlmCacheTtl = Number.isFinite(llmCacheTtlMs) ? llmCacheTtlMs : analysisTtl;
 
   const cachedResult = getCachedAnalysis({ ticker: upperTicker, baselineDate, ttlMs: analysisTtl, model: llmModel });
   if(cachedResult){
     return cachedResult;
   }
-  const storedResult = getStoredResult({ ticker: upperTicker, baselineDate, model: llmModel });
+  const storedRecord = getStoredResult({ ticker: upperTicker, baselineDate, model: llmModel });
+  const storedResult = storedRecord?.result || null;
+  const storedUpdatedAt = storedRecord?.updated_at || 0;
+  const nowTs = Date.now();
+  const storedFreshForAnalysis = storedRecord ? (nowTs - storedUpdatedAt) <= analysisTtl : false;
+  const storedFinnhub = storedFreshForAnalysis ? storedResult?.inputs?.finnhub : null;
+  const storedSecFilings = storedFreshForAnalysis ? storedResult?.inputs?.sec_filings : null;
+  const storedNewsFresh = storedRecord ? (nowTs - storedUpdatedAt) <= NEWS_CACHE_TTL_MS : false;
+  const storedMomentumFresh = storedRecord ? (nowTs - storedUpdatedAt) <= MOMENTUM_CACHE_TTL_MS : false;
+  const storedNews = storedNewsFresh ? storedResult?.inputs?.news : null;
+  const storedMomentum = storedMomentumFresh ? storedResult?.inputs?.momentum : null;
+  if(preferCacheOnly && storedFreshForAnalysis && storedResult){
+    return storedResult;
+  }
+  if(preferCacheOnly){
+    throw new Error('cache_miss');
+  }
 
   const cik = await getCIK(upperTicker, UA, SEC_KEY);
   const filings = await getRecentFilings(cik, baselineDate, UA, SEC_KEY);
-  const storedSecFilings = storedResult?.inputs?.sec_filings;
   const perFiling = await mapWithConcurrency(filings, 3, async (f)=>{
     const stored = findStoredFiling(storedSecFilings, f.form, f.filingDate);
     if(stored?.mda_summary){
@@ -279,7 +358,7 @@ async function performAnalysis(ticker, date, opts={}){
 
   const cacheContext = baselineDate;
   const finnhubCacheKey = finnhubSnapshotCacheKey(upperTicker, baselineDate);
-  let finnhubSnapshot = storedResult?.inputs?.finnhub || await readCache(finnhubCacheKey, analysisTtl);
+  let finnhubSnapshot = storedFinnhub || await readCache(finnhubCacheKey, analysisTtl);
 
   if(!finnhubSnapshot){
     const [recoRes, earnRes, quoteRes] = await Promise.allSettled([
@@ -401,7 +480,7 @@ async function performAnalysis(ticker, date, opts={}){
   const payload = {
     company: upperTicker,
     baseline_date: baselineDate,
-    sec_filings: perFiling.map(x=>({
+    sec_filings: perFiling.slice(0, MAX_FILINGS_FOR_LLM).map(x=>({
       form: x.form,
       form_label: x.formLabel || x.form,
       filingDate: x.filingDate,
@@ -413,25 +492,29 @@ async function performAnalysis(ticker, date, opts={}){
   };
 
   const newsCacheKey = newsCompactCacheKey(upperTicker, baselineDate, secondaryModel);
-  let newsCompact = storedResult?.inputs?.news || await readCache(newsCacheKey, analysisTtl);
+  let newsCompact = storedNews || await readCache(newsCacheKey, NEWS_CACHE_TTL_MS);
   if(!newsCompact){
     const newsRaw = await buildNewsBundle({ ticker: upperTicker, baselineDate, openKey: OPENAI_KEY, model: secondaryModel });
     newsCompact = compactNewsBundle(newsRaw);
     await writeCache(newsCacheKey, newsCompact);
   }
-  payload.news = newsCompact;
+  payload.news = trimNewsForPayload(newsCompact);
 
   const momentumKey = momentumCacheKey(upperTicker, baselineDate);
-  let momentum = storedResult?.inputs?.momentum || await readCache(momentumKey, analysisTtl);
+  let momentum = storedMomentum || await readCache(momentumKey, MOMENTUM_CACHE_TTL_MS);
   if(!momentum){
     const momentumRaw = await computeMomentumMetrics(upperTicker, baselineDate);
     momentum = compactMomentum(momentumRaw);
     if(momentum) await writeCache(momentumKey, momentum);
   }
   payload.momentum = momentum;
-  const llmTtlMs = analysisTtl;
-  const llm = await analyzeWithLLM(OPENAI_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
-  const llmUsage = llm?.__usage || null;
+  let llm = null;
+  let llmUsage = null;
+  if(!skipLlm){
+    const llmTtlMs = Math.min(effectiveLlmCacheTtl, analysisTtl);
+    llm = await analyzeWithLLM(OPENAI_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
+    llmUsage = llm?.__usage || null;
+  }
 
   const result = {
     input:{ticker:upperTicker, date: baselineDate},
@@ -451,7 +534,9 @@ async function performAnalysis(ticker, date, opts={}){
       momentum
     }
   };
-  saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: llmModel, result });
+  if(llm && !skipLlm){
+    saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: llmModel, result });
+  }
   return result;
 }
 
@@ -497,24 +582,32 @@ function parseBatchFile(file){
 }
 
 app.post('/api/analyze', async (req,res)=>{
-  const {ticker, date, model} = req.body||{};
+  const { ticker, date, model, analysis_model, mode } = req.body||{};
   if(!ticker||!date) return res.status(400).json({error:'ticker and date required'});
-  const resolvedModel = resolveModelName(model);
+  const resolvedModel = resolveModelName(analysis_model || model);
+  const modeKey = String(mode || '').toLowerCase();
+  const preferCacheOnly = modeKey === 'cached-only';
+  const skipLlm = modeKey === 'metrics-only';
   try{
-    const result = await performAnalysis(ticker, date, { model: resolvedModel });
+    const result = await performAnalysis(ticker, date, { model: resolvedModel, preferCacheOnly, skipLlm });
     res.json(result);
-  }catch(err){ return errRes(res, err); }
+  }catch(err){
+    if(err.message === 'cache_miss'){
+      return res.status(409).json({ error:'cached result unavailable' });
+    }
+    return errRes(res, err);
+  }
 });
 
 app.post('/api/reset-cache', async (req,res)=>{
-  const { ticker, date, model } = req.body || {};
+  const { ticker, date, model, analysis_model } = req.body || {};
   if(!ticker || !date) return res.status(400).json({ error:'ticker and date required' });
   const normalizedDate = normalizeDate(date);
   if(!normalizedDate || !dayjs(normalizedDate).isValid()){
     return res.status(400).json({ error:'invalid date' });
   }
   const upperTicker = ticker.toUpperCase();
-  const resolvedModel = resolveModelName(model);
+  const resolvedModel = resolveModelName(analysis_model || model);
   deleteAnalysis({ ticker: upperTicker, baselineDate: normalizedDate, model: resolvedModel });
   const clearedExact = clearCacheForTicker({ ticker: upperTicker, baselineDate: normalizedDate });
   const clearedAll = clearCacheForTicker({ ticker: upperTicker, includeAllDates: true });
@@ -523,16 +616,24 @@ app.post('/api/reset-cache', async (req,res)=>{
 
 app.post('/api/batch', upload.single('file'), async (req,res)=>{
   try{
+    const batchMode = String(req.query.mode || '').toLowerCase();
+    const preferCacheOnly = batchMode === 'cached-only';
+    const skipLlm = batchMode === 'metrics-only';
+    const concurrencyLimit = resolveBatchConcurrency(batchMode);
     const tasks = parseBatchFile(req.file);
     if(!tasks.length) return res.status(400).json({error:'檔案內沒有有效的 ticker/date 列'});
     const memo = new Map();
-    const rows = await mapWithConcurrency(tasks, BATCH_CONCURRENCY, async (task)=>{
+    const rows = await mapWithConcurrency(tasks, concurrencyLimit, async (task)=>{
       const resolvedModel = resolveModelName(task.model);
-      const key = `${task.ticker.toUpperCase()}__${task.date}__${resolvedModel}`;
+      const key = `${task.ticker.toUpperCase()}__${task.date}__${resolvedModel}__${batchMode}`;
       if(!memo.has(key)){
         memo.set(key, (async ()=>{
           try{
-            const result = await performAnalysis(task.ticker, task.date, { model: resolvedModel });
+            const result = await performAnalysis(task.ticker, task.date, {
+              model: resolvedModel,
+              preferCacheOnly: preferCacheOnly && !skipLlm,
+              skipLlm
+            });
             return { ok:true, result };
           }catch(error){
             return { ok:false, error };
@@ -541,6 +642,9 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
       }
       const outcome = await memo.get(key);
       if(!outcome.ok){
+        const errMessage = outcome.error?.message === 'cache_miss'
+          ? 'CACHE_ONLY：無可用快取'
+          : outcome.error?.message;
         return {
           ticker: task.ticker.toUpperCase(),
           date: task.date,
@@ -548,7 +652,7 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
           current_price: '',
           analyst_mean_target: '',
           llm_target_price: '',
-          recommendation: `ERROR: ${outcome.error.message}`,
+          recommendation: `ERROR: ${errMessage}`,
           segment: '',
           quality_score: '',
           news_sentiment: '',
