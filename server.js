@@ -19,6 +19,7 @@ import { computeMomentumMetrics } from './lib/momentum.js';
 import { getFmpQuote } from './lib/fmp.js';
 import { getYahooQuote } from './lib/yahoo.js';
 import { clearCacheForTicker, getCache as readCache, setCache as writeCache } from './lib/cache.js';
+import { getSplitRatio } from './lib/splits.js';
 import { summarizeMda } from './lib/mdaSummarizer.js';
 
 const app = express();
@@ -363,7 +364,7 @@ async function performAnalysis(ticker, date, opts={}){
 
     let ptAgg;
     try{
-      ptAgg = await getAggregatedPriceTarget(upperTicker, FH_KEY, AV_KEY, current, FMP_KEY);
+      ptAgg = await getAggregatedPriceTarget(upperTicker, FH_KEY, AV_KEY, current, FMP_KEY, baselineDate);
     }catch(e){
       ptAgg = {
         source:'unavailable',
@@ -395,14 +396,7 @@ async function performAnalysis(ticker, date, opts={}){
     kind: isHistorical ? 'historical' : 'real-time',
     value: finnhubSnapshot?.quote?.c ?? null
   };
-  const ptAgg = finnhubSnapshot?.price_target || {
-    source:'unavailable',
-    error:'missing',
-    targetHigh:null,
-    targetLow:null,
-    targetMean:null,
-    targetMedian:null
-  };
+  const ptAgg = finnhubSnapshot?.price_target || null;
 
   const payload = {
     company: upperTicker,
