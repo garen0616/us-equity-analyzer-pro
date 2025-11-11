@@ -60,6 +60,9 @@ const MAX_FILINGS_FOR_LLM = Math.max(1, Number(process.env.MAX_FILINGS_FOR_LLM |
 const NEWS_ARTICLE_LIMIT = Math.max(1, Number(process.env.NEWS_ARTICLE_LIMIT || 4));
 const NEWS_EVENT_LIMIT = Math.max(1, Number(process.env.NEWS_EVENT_LIMIT || 3));
 const NEWS_KEYWORD_LIMIT = Math.max(1, Number(process.env.NEWS_KEYWORD_LIMIT || 3));
+const PREWARM_TICKERS = (process.env.PREWARM_TICKERS || '').split(',').map(t=>t.trim()).filter(Boolean);
+const PREWARM_INTERVAL_HOURS = Number(process.env.PREWARM_INTERVAL_HOURS || 6);
+const PREWARM_INCLUDE_LLM = process.env.PREWARM_INCLUDE_LLM === 'true';
 
 function resolveModelName(requested, opts={}){
   const preferSecondary = Boolean(opts.preferSecondary);
@@ -86,6 +89,34 @@ function resolveModelName(requested, opts={}){
 
 function resolveSecondaryModel(){
   return OPENAI_SECONDARY_MODEL;
+}
+
+function slimValue(value, key){
+  if(value==null) return null;
+  if(typeof value === 'string'){
+    const limit = /summary|explanation|mda/i.test(key || '') ? 900 : 300;
+    return value.length > limit ? `${value.slice(0, limit)}...` : value;
+  }
+  if(typeof value === 'number' && !Number.isFinite(value)) return null;
+  if(typeof value === 'object' && !Array.isArray(value)){
+    const out = {};
+    for(const [k,v] of Object.entries(value)){
+      const slimmed = slimValue(v, k);
+      if(slimmed!=null){
+        out[k] = slimmed;
+      }
+    }
+    return Object.keys(out).length ? out : null;
+  }
+  if(Array.isArray(value)){
+    const arr = value.map(item=>slimValue(item, key)).filter(item=>item!=null);
+    return arr.length ? arr : null;
+  }
+  return value;
+}
+
+function buildSlimPayload(payload){
+  return slimValue(payload, '');
 }
 
 function filingSummaryCacheKey(ticker, form, filingDate){
@@ -538,7 +569,8 @@ async function performAnalysis(ticker, date, opts={}){
       openKey: skipLlm ? null : OPENAI_KEY,
       model: secondaryModel,
       useLlm: !skipLlm,
-      articleLimit: NEWS_ARTICLE_LIMIT
+      articleLimit: NEWS_ARTICLE_LIMIT,
+      finnhubKey: FH_KEY
     });
     newsCompact = compactNewsBundle(newsRaw);
     await writeCache(newsCacheKey, newsCompact);
@@ -555,9 +587,17 @@ async function performAnalysis(ticker, date, opts={}){
   payload.momentum = momentum;
   let llm = null;
   let llmUsage = null;
-  if(!skipLlm){
+  if(skipLlm){
+    llm = storedResult?.analysis || null;
+    llmUsage = storedResult?.llm_usage || null;
+  }else{
     const llmTtlMs = Math.min(effectiveLlmCacheTtl, analysisTtl);
-    llm = await analyzeWithLLM(OPENAI_KEY, llmModel, payload, { cacheTtlMs: llmTtlMs, promptVersion: 'profile_v2' });
+    const slimPayload = buildSlimPayload(payload) || payload;
+    llm = await analyzeWithLLM(OPENAI_KEY, llmModel, slimPayload, {
+      cacheTtlMs: llmTtlMs,
+      promptVersion: 'profile_v2',
+      fallbackModel: secondaryModel
+    });
     llmUsage = llm?.__usage || null;
   }
 
@@ -630,10 +670,15 @@ app.post('/api/analyze', async (req,res)=>{
   const resolvedModel = resolveModelName(analysis_model || model);
   const modeKey = String(mode || '').toLowerCase();
   const preferCacheOnly = modeKey === 'cached-only';
-  const skipLlm = modeKey === 'metrics-only';
+  const deferredMode = modeKey === 'deferred';
+  const skipLlm = modeKey === 'metrics-only' || deferredMode;
   try{
     const result = await performAnalysis(ticker, date, { model: resolvedModel, preferCacheOnly, skipLlm });
     res.json(result);
+    if(deferredMode){
+      performAnalysis(ticker, date, { model: resolvedModel, preferCacheOnly:false, skipLlm:false })
+        .catch(err=>console.warn('[deferred] background LLM failed', err.message));
+    }
   }catch(err){
     if(err.message === 'cache_miss'){
       return res.status(409).json({ error:'cached result unavailable' });
@@ -750,3 +795,23 @@ app.get('/selftest', async (req,res)=>{
 });
 
 app.listen(PORT, ()=> console.log(`🚀 http://localhost:${PORT}`));
+schedulePrewarm();
+
+function schedulePrewarm(){
+  if(!PREWARM_TICKERS.length) return;
+  const intervalMs = Math.max(1, PREWARM_INTERVAL_HOURS) * 60 * 60 * 1000;
+  const run = async ()=>{
+    for(const ticker of PREWARM_TICKERS){
+      try{
+        await performAnalysis(ticker, dayjs().format('YYYY-MM-DD'), {
+          model: resolveModelName(),
+          skipLlm: !PREWARM_INCLUDE_LLM
+        });
+      }catch(err){
+        console.warn('[prewarm]', ticker, err.message);
+      }
+    }
+  };
+  run();
+  setInterval(run, intervalMs);
+}
