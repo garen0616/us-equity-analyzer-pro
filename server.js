@@ -327,19 +327,32 @@ async function performAnalysis(ticker, date, opts={}){
   const secondaryModel = resolveSecondaryModel();
   const effectiveLlmCacheTtl = Number.isFinite(llmCacheTtlMs) ? llmCacheTtlMs : analysisTtl;
   const useSecondarySummaries = !skipLlm && Boolean(OPENAI_KEY);
+  const cacheModelKey = skipLlm ? `${llmModel}__metrics` : `${llmModel}__full`;
 
-  const cachedResult = getCachedAnalysis({
-    ticker: upperTicker,
-    baselineDate,
-    ttlMs: analysisTtl,
-    model: llmModel,
-    requireAnalysis: !skipLlm
-  });
-  if(cachedResult){
-    return cachedResult;
+  const cacheLookupKeys = skipLlm ? [cacheModelKey] : [cacheModelKey, llmModel];
+  let cacheHit = null;
+  for(const key of cacheLookupKeys){
+    cacheHit = getCachedAnalysis({
+      ticker: upperTicker,
+      baselineDate,
+      ttlMs: analysisTtl,
+      model: key,
+      requireAnalysis: !skipLlm
+    });
+    if(cacheHit){
+      if(key !== cacheModelKey){
+        saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: cacheModelKey, result: cacheHit });
+      }
+      return cacheHit;
+    }
   }
-  const storedRecord = getStoredResult({ ticker: upperTicker, baselineDate, model: llmModel });
-  const storedResult = storedRecord?.result || null;
+
+  let storedRecord = getStoredResult({ ticker: upperTicker, baselineDate, model: cacheModelKey });
+  let storedResult = storedRecord?.result || null;
+  if(!storedResult && !skipLlm){
+    storedRecord = getStoredResult({ ticker: upperTicker, baselineDate, model: llmModel });
+    storedResult = storedRecord?.result || null;
+  }
   const storedUpdatedAt = storedRecord?.updated_at || 0;
   const nowTs = Date.now();
   const storedFreshForAnalysis = storedRecord ? (nowTs - storedUpdatedAt) <= analysisTtl : false;
@@ -420,11 +433,12 @@ async function performAnalysis(ticker, date, opts={}){
     return snapshot;
   });
 
-  const cacheContext = baselineDate;
-  const finnhubCacheKey = finnhubSnapshotCacheKey(upperTicker, baselineDate);
-  let finnhubSnapshot = storedFinnhub || await readCache(finnhubCacheKey, analysisTtl);
-
-  if(!finnhubSnapshot){
+  const finnhubPromise = (async ()=>{
+    if(storedFinnhub) return storedFinnhub;
+    const cacheContext = baselineDate;
+    const finnhubCacheKey = finnhubSnapshotCacheKey(upperTicker, baselineDate);
+    const cached = await readCache(finnhubCacheKey, analysisTtl);
+    if(cached) return cached;
     const [recoRes, earnRes, quoteRes] = await Promise.allSettled([
       withRetries(()=>getRecommendations(upperTicker, FH_KEY, cacheContext)),
       withRetries(()=>getEarnings(upperTicker, FH_KEY, cacheContext)),
@@ -445,11 +459,11 @@ async function performAnalysis(ticker, date, opts={}){
 
     if(isHistorical){
       try{
-      const hist = await withRetries(()=>getHistoricalPrice(upperTicker, baselineDate, {
-        fmpKey: FMP_KEY,
-        finnhubKey: FH_KEY,
-        alphaKey: AV_KEY,
-      }), 2, RETRY_DELAY_MS);
+        const hist = await withRetries(()=>getHistoricalPrice(upperTicker, baselineDate, {
+          fmpKey: FMP_KEY,
+          finnhubKey: FH_KEY,
+          alphaKey: AV_KEY,
+        }), 2, RETRY_DELAY_MS);
         if(hist?.price!=null){
           current = hist.price;
           priceMeta.source = hist.source;
@@ -463,7 +477,7 @@ async function performAnalysis(ticker, date, opts={}){
     }else{
       if(FMP_KEY){
         try{
-      const quote = await withRetries(()=>getFmpQuote(upperTicker, FMP_KEY));
+          const quote = await withRetries(()=>getFmpQuote(upperTicker, FMP_KEY));
           current = quote.price;
           priceMeta.source = 'fmp_quote';
           if(quote.asOf) priceMeta.as_of = quote.asOf;
@@ -471,7 +485,7 @@ async function performAnalysis(ticker, date, opts={}){
       }
       if(current==null){
         try{
-      const yahoo = await withRetries(()=>getYahooQuote(upperTicker));
+          const yahoo = await withRetries(()=>getYahooQuote(upperTicker));
           current = yahoo.price;
           priceMeta.source = yahoo.source;
           if(yahoo.asOf) priceMeta.as_of = yahoo.asOf;
@@ -519,7 +533,7 @@ async function performAnalysis(ticker, date, opts={}){
       };
     }
 
-    finnhubSnapshot = {
+    const snapshot = {
       recommendation: Array.isArray(finnhub.recommendation)
         ? compactRecommendation(finnhub.recommendation)
         : (finnhub.recommendation?.error ? { error: finnhub.recommendation.error } : null),
@@ -530,8 +544,47 @@ async function performAnalysis(ticker, date, opts={}){
       price_target: ptAgg,
       price_meta: priceMeta
     };
-    await writeCache(finnhubCacheKey, finnhubSnapshot);
-  }
+    await writeCache(finnhubCacheKey, snapshot);
+    return snapshot;
+  })();
+
+  const newsPromise = (async ()=>{
+    const newsModelKey = skipLlm ? 'noai' : secondaryModel;
+    const newsCacheKey = newsCompactCacheKey(upperTicker, baselineDate, newsModelKey);
+    let newsCompact = storedNews || await readCache(newsCacheKey, NEWS_CACHE_TTL_MS);
+    if(!newsCompact){
+      const newsRaw = await buildNewsBundle({
+        ticker: upperTicker,
+        baselineDate,
+        openKey: skipLlm ? null : OPENAI_KEY,
+        model: secondaryModel,
+        useLlm: !skipLlm,
+        articleLimit: NEWS_ARTICLE_LIMIT,
+        finnhubKey: FH_KEY,
+        fmpKey: FMP_KEY
+      });
+      newsCompact = compactNewsBundle(newsRaw);
+      await writeCache(newsCacheKey, newsCompact);
+    }
+    return newsCompact;
+  })();
+
+  const momentumPromise = (async ()=>{
+    const momentumKey = momentumCacheKey(upperTicker, baselineDate);
+    let momentum = storedMomentum || await readCache(momentumKey, MOMENTUM_CACHE_TTL_MS);
+    if(!momentum){
+      const momentumRaw = await computeMomentumMetrics(upperTicker, baselineDate);
+      momentum = compactMomentum(momentumRaw);
+      if(momentum) await writeCache(momentumKey, momentum);
+    }
+    return momentum;
+  })();
+
+  const [finnhubSnapshot, newsCompact, momentum] = await Promise.all([
+    finnhubPromise,
+    newsPromise,
+    momentumPromise
+  ]);
 
   const priceMeta = finnhubSnapshot?.price_meta || {
     source: isHistorical ? 'historical_missing' : 'real-time_missing',
@@ -560,32 +613,7 @@ async function performAnalysis(ticker, date, opts={}){
     finnhub: finnhubSnapshot
   };
 
-  const newsModelKey = skipLlm ? 'noai' : secondaryModel;
-  const newsCacheKey = newsCompactCacheKey(upperTicker, baselineDate, newsModelKey);
-  let newsCompact = storedNews || await readCache(newsCacheKey, NEWS_CACHE_TTL_MS);
-  if(!newsCompact){
-    const newsRaw = await buildNewsBundle({
-      ticker: upperTicker,
-      baselineDate,
-      openKey: skipLlm ? null : OPENAI_KEY,
-      model: secondaryModel,
-      useLlm: !skipLlm,
-      articleLimit: NEWS_ARTICLE_LIMIT,
-      finnhubKey: FH_KEY,
-      fmpKey: FMP_KEY
-    });
-    newsCompact = compactNewsBundle(newsRaw);
-    await writeCache(newsCacheKey, newsCompact);
-  }
   payload.news = trimNewsForPayload(newsCompact);
-
-  const momentumKey = momentumCacheKey(upperTicker, baselineDate);
-  let momentum = storedMomentum || await readCache(momentumKey, MOMENTUM_CACHE_TTL_MS);
-  if(!momentum){
-    const momentumRaw = await computeMomentumMetrics(upperTicker, baselineDate);
-    momentum = compactMomentum(momentumRaw);
-    if(momentum) await writeCache(momentumKey, momentum);
-  }
   payload.momentum = momentum;
   let llm = null;
   let llmUsage = null;
@@ -621,7 +649,7 @@ async function performAnalysis(ticker, date, opts={}){
       momentum
     }
   };
-  saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: llmModel, result });
+  saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: cacheModelKey, result });
   return result;
 }
 
@@ -698,7 +726,10 @@ app.post('/api/reset-cache', async (req,res)=>{
   }
   const upperTicker = ticker.toUpperCase();
   const resolvedModel = resolveModelName(analysis_model || model);
-  deleteAnalysis({ ticker: upperTicker, baselineDate: normalizedDate, model: resolvedModel });
+  const variants = new Set([resolvedModel, `${resolvedModel}__full`, `${resolvedModel}__metrics`]);
+  for(const variant of variants){
+    deleteAnalysis({ ticker: upperTicker, baselineDate: normalizedDate, model: variant });
+  }
   const clearedExact = clearCacheForTicker({ ticker: upperTicker, baselineDate: normalizedDate });
   const clearedAll = clearCacheForTicker({ ticker: upperTicker, includeAllDates: true });
   res.json({ ok:true, cleared_cache_files: clearedExact + clearedAll });
