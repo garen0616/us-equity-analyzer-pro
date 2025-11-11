@@ -32,7 +32,8 @@ const UA   = process.env.SEC_USER_AGENT || 'App/1.0 (email@example.com)';
 const SEC_KEY = process.env.SEC_API_KEY || '';
 const FH_KEY  = process.env.FINNHUB_KEY || '';
 const AV_KEY  = process.env.ALPHAVANTAGE_KEY || '';
-const FMP_KEY = process.env.FMP_API_KEY || process.env.FMP_KEY || '';
+const PREMIUM_FMP_KEY_FALLBACK = 'TDc1M5BjkEmnB57iOmmfvi8QdBdRLYFA';
+const FMP_KEY = process.env.FMP_API_KEY || process.env.FMP_KEY || PREMIUM_FMP_KEY_FALLBACK;
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5';
 const OPENAI_SECONDARY_MODEL = process.env.OPENAI_MODEL_SECONDARY || 'gpt-4o-mini';
@@ -570,7 +571,8 @@ async function performAnalysis(ticker, date, opts={}){
       model: secondaryModel,
       useLlm: !skipLlm,
       articleLimit: NEWS_ARTICLE_LIMIT,
-      finnhubKey: FH_KEY
+      finnhubKey: FH_KEY,
+      fmpKey: FMP_KEY
     });
     newsCompact = compactNewsBundle(newsRaw);
     await writeCache(newsCacheKey, newsCompact);

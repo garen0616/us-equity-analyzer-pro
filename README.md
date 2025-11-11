@@ -8,7 +8,8 @@
 - 必要 API key（放進 `.env`）：
   - `SEC_USER_AGENT`：SEC 強制要求，可填 `YourApp/1.0 (email@example.com)`
   - `FINNHUB_KEY`：取得推薦 / 財報 / 報價（作為 FMP 失敗時的備援）
-  - `FMP_API_KEY`：Financial Modeling Prep Pro，優先提供即時價、歷史價、動能序列與分析師目標價
+- `FMP_API_KEY`：Financial Modeling Prep Pro，優先提供即時價、歷史價、動能序列與分析師目標價
+- （選填）若未設定 `FMP_API_KEY`，後端會 fallback 至預設的 Premium key `TDc1M5BjkEmnB57iOmmfvi8QdBdRLYFA`，方便立即測試；正式環境建議自行於環境變數覆寫。
 - `OPENAI_API_KEY`：呼叫 LLM（預設模型 `gpt-5`，可用 `OPENAI_MODEL` 覆寫；前置摘要/新聞任務可透過 `OPENAI_MODEL_SECONDARY` 指定較小模型，預設 `gpt-4o-mini`）
 - 推薦 API key：
   - `SEC_API_KEY`：提升 SEC API 速率
@@ -22,6 +23,8 @@
 - `MAX_FILINGS_FOR_LLM`：送入 LLM 的財報份數（其餘仍儲存在結果中），預設 2 份。
 - `NEWS_ARTICLE_LIMIT` / `NEWS_EVENT_LIMIT` / `NEWS_KEYWORD_LIMIT`：送入 LLM 的新聞、事件與關鍵字數量上限。
 - `MDA_MAX_INPUT_CHARS`：MD&A 摘要輸入字元上限，預設 9,000。
+- 新聞來源優先順序：FMP Premium News → GDELT → Finnhub company news，再由 LLM（或 heuristics）整理為關鍵事件，確保大量呼叫時仍穩定且省 token。
+- Cost logging 目前引用 OpenAI 官方價格表：`gpt-4o` 每百萬 token $5（輸入）/$15（輸出），`gpt-4o-mini` 每百萬 token $0.15 / $0.60。`gpt-5` 則可透過 `OPENAI_GPT5_INPUT_COST_PER_TOKEN` / `OPENAI_GPT5_OUTPUT_COST_PER_TOKEN` 覆寫。
 
 ## 安裝與啟動
 
