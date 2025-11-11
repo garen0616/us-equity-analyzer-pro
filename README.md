@@ -25,6 +25,7 @@
 - `NEWS_ARTICLE_LIMIT` / `NEWS_EVENT_LIMIT` / `NEWS_KEYWORD_LIMIT`：送入 LLM 的新聞、事件與關鍵字數量上限。
 - `MDA_MAX_INPUT_CHARS`：MD&A 摘要輸入字元上限，預設 9,000。
 - 新聞來源優先順序：FMP Premium News → GDELT → Finnhub company news，再由 LLM（或 heuristics）整理為關鍵事件，確保大量呼叫時仍穩定且省 token。
+- FMP 13F 與 Earnings Call：後端會定期快取 13F 持股變化（前五大機構、淨加減碼）與最近一季 Earnings Call Transcript 摘要（次要模型生成要點），前端卡片與批次 CSV 都會同步顯示。
 - Cost logging 目前引用 OpenAI 官方價格表：`gpt-4o` 每百萬 token $5（輸入）/$15（輸出），`gpt-4o-mini` 每百萬 token $0.15 / $0.60。`gpt-5` 則可透過 `OPENAI_GPT5_INPUT_COST_PER_TOKEN` / `OPENAI_GPT5_OUTPUT_COST_PER_TOKEN` 覆寫。
 
 ## 安裝與啟動

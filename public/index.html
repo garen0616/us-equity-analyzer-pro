@@ -129,6 +129,17 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
     <div id="newsSummary" class="summary muted">尚無新聞</div>
     <div id="newsArticles" class="summary" style="margin-top:8px"></div>
   </div>
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin:0 0 8px">機構持股（13F）</h3>
+    <div id="instSummary" class="summary muted">尚無資料</div>
+    <div id="instDetail" class="summary" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3 style="margin:0 0 8px">Earnings Call 摘要</h3>
+    <div id="callSummary" class="summary muted">尚無資料</div>
+    <div id="callDetail" class="summary" style="margin-top:8px"></div>
+  </div>
 
   <div class="card" style="margin-top:16px">
     <h3 style="margin:0 0 8px">分析紀錄</h3>
@@ -138,7 +149,7 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
   <div class="card" style="margin-top:16px">
     <h3 style="margin:0 0 8px">批次分析</h3>
     <div class="summary muted" style="margin-bottom:12px">
-      利用下方工作列上傳 Excel/CSV（第一欄 ticker、第二欄 date，舊版第三欄 model 可留空），系統會逐行呼叫分析並下載包含現價、分析師平均/共識目標價、ChatGPT 目標價、建議、類型、體質分數、新聞情緒、動能分數與趨勢燈號的 CSV。
+      利用下方工作列上傳 Excel/CSV（第一欄 ticker、第二欄 date，舊版第三欄 model 可留空），系統會逐行呼叫分析並下載包含現價、分析師平均/共識目標價、ChatGPT 目標價、建議、類型、體質分數、新聞情緒、動能分數、趨勢燈號、13F 信號與 Earnings Call 摘要的 CSV。
     </div>
     <div class="summary muted">
       <strong>步驟：</strong><br/>
@@ -280,6 +291,16 @@ function formatScore(score){
 function formatPct(value){
   if(value==null || Number.isNaN(value)) return '-';
   return `${(value*100).toFixed(1)}%`;
+}
+
+function formatMillions(value){
+  const num = Number(value);
+  if(!Number.isFinite(num)) return '-';
+  const abs = Math.abs(num);
+  if(abs >= 1_000_000_000) return `${(num/1_000_000_000).toFixed(1)}B`;
+  if(abs >= 1_000_000) return `${(num/1_000_000).toFixed(1)}M`;
+  if(abs >= 1000) return `${(num/1000).toFixed(1)}K`;
+  return num.toFixed(0);
 }
 
 function normalizeInputDate(raw){
@@ -477,6 +498,70 @@ function renderNews(bundle){
   }
 }
 
+function renderInstitutional(data){
+  clearChildren(instSummaryEl);
+  clearChildren(instDetailEl);
+  if(!data){
+    appendLine(instSummaryEl, '尚無 13F 資料', 'muted');
+    return;
+  }
+  const headlineParts = [];
+  if(data.signal?.label){
+    headlineParts.push(`信號：${data.signal.label}`);
+  }
+  if(data.as_of){
+    headlineParts.push(`申報日：${data.as_of}`);
+  }
+  if(headlineParts.length){
+    appendLine(instSummaryEl, headlineParts.join(' ｜ '));
+  }
+  appendLine(instSummaryEl, data.summary || '最近未見顯著變動。', 'muted');
+  const top = Array.isArray(data.top_holders) ? data.top_holders : [];
+  if(top.length){
+    appendLine(instDetailEl, '前五大機構', '');
+    top.forEach(holder=>{
+      const weightText = holder.weight!=null ? formatPct(holder.weight) : '';
+      const changeText = holder.change_shares ? `，變動 ${formatMillions(holder.change_shares)} 股` : '';
+      appendLine(
+        instDetailEl,
+        `• ${holder.name || '機構'}：${formatMillions(holder.value)} ${weightText?`（${weightText}）`:''}${changeText}`,
+        'muted'
+      );
+    });
+  }
+}
+
+function renderEarningsCall(data){
+  clearChildren(callSummaryEl);
+  clearChildren(callDetailEl);
+  if(!data){
+    appendLine(callSummaryEl, '尚無 Earnings Call 摘要', 'muted');
+    return;
+  }
+  const titleParts = [];
+  if(data.quarter) titleParts.push(data.quarter);
+  if(data.date) titleParts.push(data.date);
+  appendLine(callSummaryEl, titleParts.join(' ｜ ') || '最新 Earnings Call');
+  appendLine(callSummaryEl, data.summary || '尚無摘要', 'muted');
+  const bullets = Array.isArray(data.bullets) ? data.bullets : [];
+  if(bullets.length){
+    bullets.forEach(item=>{
+      appendLine(callDetailEl, `• ${item.title || '重點'}：${item.detail || ''}`, 'muted');
+    });
+  }else if(data.raw_excerpt){
+    appendLine(callDetailEl, data.raw_excerpt, 'muted');
+  }
+  if(data.source){
+    const link = document.createElement('a');
+    link.href = safeUrl(data.source);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = '查看完整逐字稿';
+    link.style.marginTop = '6px';
+    callDetailEl.appendChild(link);
+  }
+}
+
 function renderHistory(){
   clearChildren(historyListEl);
   if(!analysisHistory.length){
@@ -557,6 +642,10 @@ const momentumDetailEl = document.getElementById('momentumDetail');
 const newsSentimentEl = document.getElementById('newsSentiment');
 const newsSummaryEl = document.getElementById('newsSummary');
 const newsArticlesEl = document.getElementById('newsArticles');
+const instSummaryEl = document.getElementById('instSummary');
+const instDetailEl = document.getElementById('instDetail');
+const callSummaryEl = document.getElementById('callSummary');
+const callDetailEl = document.getElementById('callDetail');
 const historyListEl = document.getElementById('historyList');
 const refreshBtn = document.getElementById('refreshCache');
 const refreshLabel = refreshBtn?.textContent || '重新抓取';
@@ -570,6 +659,8 @@ const analysisHistory = [];
 let lastCompletedParams = null;
 
 renderNews(null);
+renderInstitutional(null);
+renderEarningsCall(null);
 renderMomentum(null);
 renderHistory();
 setRefreshState('disabled');
@@ -663,6 +754,8 @@ async function analyze(){
     renderConclusion(j?.analysis, j?.llm_usage);
     renderProfile(j?.analysis?.profile);
     renderNews(j?.news);
+    renderInstitutional(j?.institutional);
+    renderEarningsCall(j?.earnings_call);
     renderMomentum(j?.momentum);
     const newsLabel = j?.news?.sentiment?.sentiment_label ? `新聞：${j.news.sentiment.sentiment_label}` : '';
     const momentumLabel = j?.momentum?.trend ? `動能：${j.momentum.trend}` : '';

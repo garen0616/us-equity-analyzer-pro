@@ -16,11 +16,12 @@ import { getHistoricalPrice } from './lib/historicalPrice.js';
 import { getCachedAnalysis, saveAnalysisResult, deleteAnalysis, getStoredResult } from './lib/analysisStore.js';
 import { buildNewsBundle } from './lib/news.js';
 import { computeMomentumMetrics } from './lib/momentum.js';
-import { getFmpQuote } from './lib/fmp.js';
+import { getFmpQuote, getFmpInstitutionalHolders, getFmpEarningsCallTranscript } from './lib/fmp.js';
 import { getYahooQuote } from './lib/yahoo.js';
 import { clearCacheForTicker, getCache as readCache, setCache as writeCache } from './lib/cache.js';
 import { getSplitRatio } from './lib/splits.js';
 import { summarizeMda } from './lib/mdaSummarizer.js';
+import { summarizeCallTranscript } from './lib/callSummarizer.js';
 import { enqueueJob } from './lib/jobQueue.js';
 import { getAdaptiveLimits, recordUsage } from './lib/usageMonitor.js';
 
@@ -59,6 +60,8 @@ const RETRY_ATTEMPTS = Number(process.env.API_RETRY_ATTEMPTS || 3);
 const RETRY_DELAY_MS = Number(process.env.API_RETRY_DELAY_MS || 1500);
 const NEWS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const MOMENTUM_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const THIRTEENF_CACHE_TTL_MS = 30 * DAY_MS;
+const EARNINGS_CALL_TTL_MS = 30 * DAY_MS;
 const MAX_FILINGS_FOR_LLM = Math.max(1, Number(process.env.MAX_FILINGS_FOR_LLM || 2));
 const NEWS_ARTICLE_LIMIT = Math.max(1, Number(process.env.NEWS_ARTICLE_LIMIT || 4));
 const NEWS_EVENT_LIMIT = Math.max(1, Number(process.env.NEWS_EVENT_LIMIT || 3));
@@ -144,6 +147,25 @@ function buildSlimPayload(payload){
       a: payload.news.articles,
       s: payload.news.sentiment
     } : null,
+    inst: payload.institutional ? {
+      s: payload.institutional.summary,
+      sig: payload.institutional.signal?.label,
+      top: Array.isArray(payload.institutional.top_holders)
+        ? payload.institutional.top_holders.map(holder=>({
+            n: holder.name,
+            w: holder.weight,
+            v: holder.value,
+            c: holder.change_shares
+          }))
+        : null
+    } : null,
+    ec: payload.earnings_call ? {
+      q: payload.earnings_call.quarter,
+      s: payload.earnings_call.summary,
+      b: Array.isArray(payload.earnings_call.bullets)
+        ? payload.earnings_call.bullets.map(item=>({ t:item.title, d:item.detail }))
+        : null
+    } : null,
     m: payload.momentum ? {
       s: payload.momentum.score,
       t: payload.momentum.trend,
@@ -165,6 +187,112 @@ function buildSlimPayload(payload){
 function toBps(value, scale=10000){
   if(typeof value !== 'number' || Number.isNaN(value)) return null;
   return Math.round(value * scale);
+}
+
+function resolveQuarterYear(date){
+  const parsed = dayjs(date);
+  const month = parsed.month(); // 0-index
+  const quarter = Math.floor(month / 3) + 1;
+  const year = parsed.year();
+  return { quarter, year };
+}
+
+function shiftQuarter(base, offset){
+  let { quarter, year } = base;
+  let steps = offset;
+  while(steps !== 0){
+    if(steps > 0){
+      quarter++;
+      if(quarter > 4){
+        quarter = 1;
+        year++;
+      }
+      steps--;
+    }else{
+      quarter--;
+      if(quarter < 1){
+        quarter = 4;
+        year--;
+      }
+      steps++;
+    }
+  }
+  return { quarter, year };
+}
+
+function formatMillions(val){
+  const num = Number(val);
+  if(!Number.isFinite(num)) return '';
+  const abs = Math.abs(num);
+  if(abs >= 1_000_000_000) return `${(num/1_000_000_000).toFixed(1)}B`;
+  if(abs >= 1_000_000) return `${(num/1_000_000).toFixed(1)}M`;
+  if(abs >= 1000) return `${(num/1000).toFixed(1)}K`;
+  return num.toFixed(0);
+}
+
+function formatPercent(val, digits=1){
+  const num = Number(val);
+  if(!Number.isFinite(num)) return '';
+  const pct = num > 1 ? num : num * 100;
+  return `${pct.toFixed(digits)}%`;
+}
+
+function summarizeInstitutionalRows(rows){
+  if(!Array.isArray(rows) || !rows.length) return null;
+  const normalized = rows
+    .map(row=>{
+      const name = row.investorname || row.investorName || row.holder || row.investor || '';
+      if(!name) return null;
+      const value = Number(row.value ?? row.marketValue ?? row.marketvalue ?? row.latestValue);
+      const weightRaw = Number(row.weightPercentage ?? row.weightPercent ?? row.weight ?? row.portfolioPercent);
+      const weight = Number.isFinite(weightRaw) ? (weightRaw > 1 ? weightRaw/100 : weightRaw) : null;
+      const changeShares = Number(row.change ?? row.changeInShares ?? row.changeShares ?? row.change_shares);
+      const reportDate = row.dateReported || row.latestQuarter || row.period || row.date;
+      const changePercent = Number(row.changePercent ?? row.changePercentage);
+      const shares = Number(row.shares ?? row.share);
+      return {
+        name,
+        value: Number.isFinite(value) ? value : null,
+        weight,
+        changeShares: Number.isFinite(changeShares) ? changeShares : 0,
+        changePercent: Number.isFinite(changePercent) ? changePercent : null,
+        reportDate,
+        shares: Number.isFinite(shares) ? shares : null
+      };
+    })
+    .filter(Boolean);
+  if(!normalized.length) return null;
+  normalized.sort((a,b)=> (b.value || 0) - (a.value || 0));
+  const top = normalized.slice(0,5).map(item=>({
+    name: item.name,
+    value: item.value,
+    weight: item.weight,
+    change_shares: item.changeShares,
+    change_percent: item.changePercent
+  }));
+  const netShares = normalized.reduce((sum,item)=> sum + (item.changeShares || 0), 0);
+  const signalLabel = netShares > 0 ? '加碼' : (netShares < 0 ? '減碼' : '持平');
+  let latestDate = null;
+  normalized.forEach(item=>{
+    if(item.reportDate && (!latestDate || dayjs(item.reportDate).isAfter(dayjs(latestDate)))){
+      latestDate = item.reportDate;
+    }
+  });
+  const summaryParts = [];
+  summaryParts.push(`機構${signalLabel}${netShares ? `（淨變動 ${formatMillions(netShares)} 股）` : ''}`);
+  if(top[0]){
+    const topWeight = top[0].weight!=null ? formatPercent(top[0].weight,1) : '';
+    summaryParts.push(`${top[0].name} 約 ${formatMillions(top[0].value)} ${topWeight?`(${topWeight})`:''}`);
+  }
+  return {
+    as_of: latestDate,
+    signal:{
+      label: signalLabel,
+      net_shares: netShares
+    },
+    top_holders: top,
+    summary: summaryParts.filter(Boolean).join('；')
+  };
 }
 
 function filingSummaryCacheKey(ticker, form, filingDate){
@@ -418,6 +546,8 @@ async function performAnalysis(ticker, date, opts={}){
   const storedMomentumFresh = storedRecord ? (nowTs - storedUpdatedAt) <= MOMENTUM_CACHE_TTL_MS : false;
   const storedNews = storedNewsFresh ? storedResult?.inputs?.news : null;
   const storedMomentum = storedMomentumFresh ? storedResult?.inputs?.momentum : null;
+  const storedInstitutional = storedFreshForAnalysis ? storedResult?.inputs?.institutional : null;
+  const storedEarningsCall = storedFreshForAnalysis ? storedResult?.inputs?.earnings_call : null;
   if(preferCacheOnly && storedFreshForAnalysis && storedResult){
     return storedResult;
   }
@@ -654,10 +784,80 @@ async function performAnalysis(ticker, date, opts={}){
     };
   });
 
-  const [finnhubSnapshot, newsCompact, momentum] = await Promise.all([
+  const institutionalPromise = (async ()=>{
+    if(storedInstitutional) return storedInstitutional;
+    const cacheKey = `institutional_${upperTicker}`;
+    let summary = await readCache(cacheKey, THIRTEENF_CACHE_TTL_MS);
+    if(summary) return summary;
+    try{
+      const rows = await getFmpInstitutionalHolders(upperTicker, FMP_KEY);
+      summary = summarizeInstitutionalRows(rows);
+      if(summary) await writeCache(cacheKey, summary);
+      return summary;
+    }catch(err){
+      console.warn('[Institutional]', err.message);
+      return null;
+    }
+  })();
+
+  const earningsCallPromise = (async ()=>{
+    if(storedEarningsCall) return storedEarningsCall;
+    const base = resolveQuarterYear(baselineDate);
+    const attempts = [base, shiftQuarter(base, -1)];
+    for(const attempt of attempts){
+      const callKey = `earnings_call_${upperTicker}_${attempt.year}q${attempt.quarter}`;
+      const cached = await readCache(callKey, EARNINGS_CALL_TTL_MS);
+      if(cached){
+        if(cached.status === 'missing' && attempt !== attempts[attempts.length-1]) continue;
+        return cached;
+      }
+      try{
+        const rows = await getFmpEarningsCallTranscript({
+          symbol: upperTicker,
+          quarter: attempt.quarter,
+          year: attempt.year,
+          key: FMP_KEY
+        });
+        const transcript = Array.isArray(rows) && rows.length ? rows[0] : null;
+        if(!transcript || !transcript.content){
+          const placeholder = {
+            quarter: `Q${attempt.quarter} ${attempt.year}`,
+            summary: '近期無可用的 Earnings Call 逐字稿。',
+            bullets: [],
+            status: 'missing'
+          };
+          await writeCache(callKey, placeholder);
+          continue;
+        }
+        const summary = await summarizeCallTranscript({
+          text: transcript.content,
+          openKey: OPENAI_KEY,
+          model: secondaryModel,
+          meta:{ ticker: upperTicker, quarter:`Q${attempt.quarter}`, year: attempt.year }
+        });
+        const payload = {
+          quarter: `Q${attempt.quarter} ${attempt.year}`,
+          date: transcript.date || transcript.transcriptDate || transcript.publishedDate || '',
+          summary: summary.summary || '',
+          bullets: summary.bullets || [],
+          source: transcript.link || transcript.url || transcript.filingUrl || '',
+          raw_excerpt: transcript.content.slice(0, 500)
+        };
+        await writeCache(callKey, payload);
+        return payload;
+      }catch(err){
+        console.warn('[EarningsCall]', err.message);
+      }
+    }
+    return null;
+  })();
+
+  const [finnhubSnapshot, newsCompact, momentum, institutional, earningsCall] = await Promise.all([
     finnhubPromise,
     newsPromise,
-    momentumPromise
+    momentumPromise,
+    institutionalPromise,
+    earningsCallPromise
   ]);
 
   const priceMeta = finnhubSnapshot?.price_meta || {
@@ -684,11 +884,15 @@ async function performAnalysis(ticker, date, opts={}){
       }
       return entry;
     }),
-    finnhub: finnhubSnapshot
+    finnhub: finnhubSnapshot,
+    institutional,
+    earnings_call: earningsCall
   };
 
   payload.news = trimNewsForPayload(newsCompact, effectiveNewsLimit);
   payload.momentum = momentum;
+  payload.institutional = institutional;
+  payload.earnings_call = earningsCall;
   let llm = null;
   let llmUsage = null;
   if(skipLlm){
@@ -717,11 +921,15 @@ async function performAnalysis(ticker, date, opts={}){
     analysis_model: llmModel,
     news: newsCompact,
     momentum,
+    institutional,
+    earnings_call: earningsCall,
     inputs:{
       sec_filings: perFiling,
       finnhub: finnhubSnapshot,
       news: newsCompact,
-      momentum
+      momentum,
+      institutional,
+      earnings_call: earningsCall
     }
   };
   saveAnalysisResult({ ticker: upperTicker, baselineDate, isHistorical, model: cacheModelKey, result });
@@ -861,7 +1069,9 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
           quality_score: '',
           news_sentiment: '',
           momentum_score: '',
-          trend_flag: ''
+          trend_flag: '',
+          institutional_signal: '',
+          earnings_call_highlight: ''
         };
       }
       const result = outcome.result;
@@ -869,6 +1079,12 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
       const profile = result.analysis?.profile;
       const newsSent = result.news?.sentiment;
       const momentum = result.momentum || {};
+      const institutional = result.institutional;
+      const earningsCall = result.earnings_call;
+      const earningsHighlight = earningsCall?.summary
+        || (earningsCall?.bullets?.[0]
+          ? `${earningsCall.bullets[0].title || '重點'}：${earningsCall.bullets[0].detail || ''}`
+          : '');
       return {
         ticker: result.input.ticker,
         date: task.date,
@@ -881,10 +1097,12 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
         quality_score: profile?.score ?? '',
         news_sentiment: newsSent?.sentiment_label || '',
         momentum_score: momentum.score ?? '',
-        trend_flag: momentum.trend || ''
+        trend_flag: momentum.trend || '',
+        institutional_signal: institutional?.signal?.label || institutional?.summary || '',
+        earnings_call_highlight: earningsHighlight || ''
       };
     });
-    const fields = ['ticker','date','model','current_price','analyst_mean_target','llm_target_price','recommendation','segment','quality_score','news_sentiment','momentum_score','trend_flag'];
+    const fields = ['ticker','date','model','current_price','analyst_mean_target','llm_target_price','recommendation','segment','quality_score','news_sentiment','momentum_score','trend_flag','institutional_signal','earnings_call_highlight'];
     const csv = Papa.unparse({
       fields,
       data: rows.map(r=>fields.map(f=>r[f]))
