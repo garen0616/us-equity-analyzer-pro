@@ -377,7 +377,8 @@ async function performAnalysis(ticker, date, opts={}){
 
   const cik = await getCIK(upperTicker, UA, SEC_KEY);
   const filings = await getRecentFilings(cik, baselineDate, UA, SEC_KEY);
-  const perFiling = await mapWithConcurrency(filings, 3, async (f)=>{
+  const summaryTargets = filings.slice(0, MAX_FILINGS_FOR_LLM);
+  const perFilingSummaries = await mapWithConcurrency(summaryTargets, 3, async (f)=>{
     const stored = findStoredFiling(storedSecFilings, f.form, f.filingDate);
     if(stored?.mda_summary){
       if(useSecondarySummaries && stored.summary_kind === 'fallback'){
@@ -437,6 +438,22 @@ async function performAnalysis(ticker, date, opts={}){
       ticker: upperTicker
     });
     return snapshot;
+  });
+  const summaryIndex = new Map(perFilingSummaries.map(item=>{
+    const key = `${item.form}_${item.filingDate}`;
+    return [key, item];
+  }));
+  const perFiling = filings.map(f=>{
+    const key = `${f.form}_${f.filingDate}`;
+    if(summaryIndex.has(key)) return summaryIndex.get(key);
+    return {
+      form:f.form,
+      formLabel:f.formLabel,
+      filingDate:f.filingDate,
+      reportDate:f.reportDate,
+      mda_summary:null,
+      summary_kind:null
+    };
   });
 
   const finnhubPromise = (async ()=>{
