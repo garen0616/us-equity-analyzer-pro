@@ -280,10 +280,16 @@ function trimNewsForPayload(bundle){
   if(!bundle) return null;
   return {
     keywords: Array.isArray(bundle.keywords) ? bundle.keywords.slice(0, NEWS_KEYWORD_LIMIT) : [],
-    articles: compactArticles(bundle.articles, NEWS_ARTICLE_LIMIT),
+    articles: (bundle.articles || [])
+      .slice(0, NEWS_ARTICLE_LIMIT)
+      .map(article=>({
+        title: article.title,
+        summary: (article.summary || '').slice(0, 180),
+        published_at: article.published_at
+      })),
     sentiment: bundle.sentiment ? {
       sentiment_label: bundle.sentiment.sentiment_label,
-      summary: bundle.sentiment.summary,
+      summary: (bundle.sentiment.summary || '').slice(0, 220),
       supporting_events: Array.isArray(bundle.sentiment.supporting_events)
         ? bundle.sentiment.supporting_events.slice(0, NEWS_EVENT_LIMIT)
         : []
