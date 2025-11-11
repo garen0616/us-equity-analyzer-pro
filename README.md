@@ -7,9 +7,10 @@
 - Node.js 18+（本地開發使用 `npm run dev`）
 - 必要 API key（放進 `.env`）：
   - `SEC_USER_AGENT`：SEC 強制要求，可填 `YourApp/1.0 (email@example.com)`
-  - `FINNHUB_KEY`：取得推薦 / 財報 / 報價（作為 FMP 失敗時的備援）
+- `FINNHUB_KEY`：取得推薦 / 財報 / 報價（作為 FMP 失敗時的備援）
 - `FMP_API_KEY`：Financial Modeling Prep Pro，優先提供即時價、歷史價、動能序列與分析師目標價
 - （選填）若未設定 `FMP_API_KEY`，後端會 fallback 至預設的 Premium key `TDc1M5BjkEmnB57iOmmfvi8QdBdRLYFA`，方便立即測試；正式環境建議自行於環境變數覆寫。
+- 如需 13F / Earnings Call Transcript 功能，請確認 FMP key 有對應權限，系統會自動快取 30 天。
 - `OPENAI_API_KEY`：呼叫 LLM（預設模型 `gpt-5`，可用 `OPENAI_MODEL` 覆寫；前置摘要/新聞任務可透過 `OPENAI_MODEL_SECONDARY` 指定較小模型，預設 `gpt-4o-mini`）
 - 推薦 API key：
   - `SEC_API_KEY`：提升 SEC API 速率
