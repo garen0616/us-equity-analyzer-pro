@@ -18,6 +18,7 @@ import { buildNewsBundle } from './lib/news.js';
 import { computeMomentumMetrics } from './lib/momentum.js';
 import {
   getFmpQuote,
+  getFmpBatchQuote,
   getFmpInstitutionalHolders,
   getFmpEarningsCallTranscript,
   getFmpPriceTargetSummary,
@@ -103,6 +104,54 @@ const NEWS_KEYWORD_LIMIT = Math.max(1, Number(process.env.NEWS_KEYWORD_LIMIT || 
 const PREWARM_TICKERS = (process.env.PREWARM_TICKERS || '').split(',').map(t=>t.trim()).filter(Boolean);
 const PREWARM_INTERVAL_HOURS = Number(process.env.PREWARM_INTERVAL_HOURS || 6);
 const PREWARM_INCLUDE_LLM = process.env.PREWARM_INCLUDE_LLM === 'true';
+const REALTIME_QUOTE_TTL_MS = Number(process.env.REALTIME_QUOTE_TTL_MS || 15) * 1000;
+
+const realtimeQuoteCache = new Map();
+
+function cacheRealtimeQuote(symbol, payload){
+  if(!symbol || !payload) return;
+  realtimeQuoteCache.set(symbol.toUpperCase(), { ...payload, ts: Date.now() });
+}
+
+function getCachedRealtimeQuote(symbol){
+  if(!symbol) return null;
+  const entry = realtimeQuoteCache.get(symbol.toUpperCase());
+  if(!entry) return null;
+  if(Date.now() - entry.ts > REALTIME_QUOTE_TTL_MS){
+    realtimeQuoteCache.delete(symbol.toUpperCase());
+    return null;
+  }
+  return entry;
+}
+
+async function prefetchBatchQuotes(symbols){
+  if(!FMP_KEY) return;
+  if(!Array.isArray(symbols) || !symbols.length) return;
+  const pending = Array.from(new Set(
+    symbols
+      .map(sym=>String(sym || '').trim().toUpperCase())
+      .filter(sym=>sym && !getCachedRealtimeQuote(sym))
+  ));
+  if(!pending.length) return;
+  try{
+    const rows = await getFmpBatchQuote(pending, FMP_KEY);
+    rows.forEach(row=>{
+      const symbol = row.symbol?.toUpperCase?.();
+      const price = Number(row.price ?? row.c ?? row.currentPrice);
+      if(!symbol || !Number.isFinite(price)) return;
+      const asOf = row.timestamp
+        ? dayjs.unix(Number(row.timestamp)).format('YYYY-MM-DD')
+        : (row.date || row.lastUpdated || null);
+      cacheRealtimeQuote(symbol, {
+        price,
+        asOf,
+        source: 'fmp_batch_quote'
+      });
+    });
+  }catch(err){
+    console.warn('[FMP batch quote]', err.message);
+  }
+}
 
 function resolveModelName(requested, opts={}){
   const preferSecondary = Boolean(opts.preferSecondary);
@@ -1082,22 +1131,25 @@ function compactNewsBundle(bundle){
 
 function trimNewsForPayload(bundle, limit=NEWS_ARTICLE_LIMIT){
   if(!bundle) return null;
+  const articles = Array.isArray(bundle.articles) ? bundle.articles : [];
+  const sampledArticles = articles.slice(0, limit);
+  const sentiment = bundle.sentiment || {};
+  const supportingEvents = Array.isArray(sentiment.supporting_events)
+    ? sentiment.supporting_events.slice(0, NEWS_EVENT_LIMIT).map(ev=>({
+        title: ev.title || null,
+        note: ev.reason ? ev.reason.slice(0, 120) : null
+      }))
+    : [];
+  const topSources = Array.from(new Set(
+    sampledArticles.map(a=>(a.source || '').toUpperCase()).filter(Boolean)
+  )).slice(0,3);
   return {
     keywords: Array.isArray(bundle.keywords) ? bundle.keywords.slice(0, NEWS_KEYWORD_LIMIT) : [],
-    articles: (bundle.articles || [])
-      .slice(0, limit)
-      .map(article=>({
-        title: article.title,
-        summary: (article.summary || '').slice(0, 180),
-        published_at: article.published_at
-      })),
-    sentiment: bundle.sentiment ? {
-      sentiment_label: bundle.sentiment.sentiment_label,
-      summary: (bundle.sentiment.summary || '').slice(0, 220),
-      supporting_events: Array.isArray(bundle.sentiment.supporting_events)
-        ? bundle.sentiment.supporting_events.slice(0, NEWS_EVENT_LIMIT)
-        : []
-    } : null
+    sentiment_label: sentiment.sentiment_label || null,
+    article_count: articles.length,
+    event_count: supportingEvents.length,
+    top_sources: topSources,
+    events: supportingEvents
   };
 }
 
@@ -1229,12 +1281,21 @@ async function performAnalysis(ticker, date, opts={}){
         priceMeta.kind = 'real-time';
       }
     }else{
+      const cachedRealtime = getCachedRealtimeQuote(upperTicker);
+      if(cachedRealtime){
+        current = cachedRealtime.price;
+        priceMeta.source = cachedRealtime.source || 'fmp_batch_quote';
+        if(cachedRealtime.asOf) priceMeta.as_of = cachedRealtime.asOf;
+      }
       if(FMP_KEY){
         try{
-          const quote = await withRetries(()=>getFmpQuote(upperTicker, FMP_KEY));
-          current = quote.price;
-          priceMeta.source = 'fmp_quote';
-          if(quote.asOf) priceMeta.as_of = quote.asOf;
+          if(current==null){
+            const quote = await withRetries(()=>getFmpQuote(upperTicker, FMP_KEY));
+            current = quote.price;
+            priceMeta.source = 'fmp_quote';
+            if(quote.asOf) priceMeta.as_of = quote.asOf;
+            cacheRealtimeQuote(upperTicker, { price: current, asOf: quote.asOf, source: 'fmp_quote' });
+          }
         }catch(err){ console.warn('[FMP Quote]', err.message); }
       }
       if(current==null){
@@ -1258,6 +1319,7 @@ async function performAnalysis(ticker, date, opts={}){
         priceMeta.source = 'fmp_quote';
         priceMeta.as_of = quote.asOf || priceMeta.as_of;
         priceMeta.kind = 'real-time';
+        cacheRealtimeQuote(upperTicker, { price: current, asOf: quote.asOf, source: 'fmp_quote' });
       }catch(err){ console.warn('[FMP Quote fallback]', err.message); }
     }
     if(current==null){
@@ -1490,19 +1552,18 @@ async function performAnalysis(ticker, date, opts={}){
     if(!FMP_KEY) return null;
     const aggregateKey = `analyst_signals_${upperTicker}`;
     const aggregateCached = await readCache(aggregateKey, ANALYST_AGGREGATE_TTL_MS);
-    if(aggregateCached) return aggregateCached.__empty ? null : aggregateCached;
+    if(aggregateCached) return aggregateCached;
 
     const fetchWithTtl = async ({ label, ttl, fetcher })=>{
       const key = `analyst_${label}_${upperTicker}`;
       const memo = await readCache(key, ttl);
-      if(memo) return memo.__empty ? null : memo;
+      if(memo) return memo;
       try{
         const data = await fetcher();
-        await writeCache(key, data ?? { __empty:true });
+        if(data) await writeCache(key, data);
         return data ?? null;
       }catch(err){
         console.warn(`[AnalystSignals:${label}]`, err.message);
-        await writeCache(key, { __empty:true });
         return null;
       }
     };
@@ -1563,7 +1624,6 @@ async function performAnalysis(ticker, date, opts={}){
       await writeCache(aggregateKey, normalized);
       return normalized;
     }
-    await writeCache(aggregateKey, { __empty:true });
     return null;
   })();
 
@@ -1732,6 +1792,11 @@ app.post('/api/batch', upload.single('file'), async (req,res)=>{
     const concurrencyLimit = resolveBatchConcurrency(batchMode);
     const tasks = parseBatchFile(req.file);
     if(!tasks.length) return res.status(400).json({error:'檔案內沒有有效的 ticker/date 列'});
+    await prefetchBatchQuotes(
+      tasks
+        .filter(task=>!dayjs(task.date).isBefore(dayjs(), 'day'))
+        .map(task=>task.ticker)
+    );
     const memo = new Map();
     const rows = await mapWithConcurrency(tasks, concurrencyLimit, async (task)=>{
       const resolvedModel = resolveModelName(task.model);

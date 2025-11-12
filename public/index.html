@@ -597,10 +597,15 @@ function renderNews(bundle){
     return;
   }
   const sentiment = bundle.sentiment || {};
-  const summaryText = `${sentiment.sentiment_label || '中性'} · ${sentiment.summary || '（尚無摘要）'}`;
-  appendLine(newsSummaryEl, summaryText);
   const events = Array.isArray(sentiment.supporting_events) ? sentiment.supporting_events : [];
   const articles = Array.isArray(bundle.articles) ? bundle.articles : [];
+  if(!events.length && !articles.length){
+    appendLine(newsSummaryEl, '尚無新聞', 'muted');
+    appendLine(newsArticlesEl, '（尚無可用新聞）', 'muted');
+    return;
+  }
+  const summaryText = `${sentiment.sentiment_label || '中性'} · ${sentiment.summary || '（尚無摘要）'}`;
+  appendLine(newsSummaryEl, summaryText);
   if(events.length){
     appendLine(newsArticlesEl, '關鍵事件', '');
     events.forEach(ev=>{
