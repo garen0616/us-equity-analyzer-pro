@@ -28,8 +28,6 @@ import {
   getFmpGrades,
   getFmpGradesHistorical,
   getFmpGradesConsensus,
-  getFmpAftermarketQuote,
-  getFmpAftermarketTrades,
   getFmpInsiderTrading,
   getFmpInsiderStats,
   getFmpAnalystActions,
@@ -439,26 +437,6 @@ function summarizePriceTargetSummary(row){
     all_time:{ count: row.allTimeCount ?? null, avg: row.allTimeAvgPriceTarget ?? null },
     publishers: parsePublishers(row.publishers)
   };
-}
-
-async function fetchAftermarketSnapshot(ticker){
-  if(!FMP_KEY) return null;
-  const cacheKey = `aftermarket_${ticker}`;
-  const cached = await readCache(cacheKey, AFTERMARKET_CACHE_TTL_MS);
-  if(cached) return cached.__empty ? null : cached;
-  try{
-    const [quote, trades] = await Promise.all([
-      getFmpAftermarketQuote(ticker, FMP_KEY),
-      getFmpAftermarketTrades(ticker, FMP_KEY, { limit:3 })
-    ]);
-    const normalized = normalizeExtendedQuoteSnapshot(quote, trades);
-    await writeCache(cacheKey, normalized || { __empty:true });
-    return normalized;
-  }catch(err){
-    console.warn('[Aftermarket]', err.message);
-    await writeCache(cacheKey, { __empty:true });
-    return null;
-  }
 }
 
 async function fetchInsiderSnapshot(ticker, baselineDate){
