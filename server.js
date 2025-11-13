@@ -354,23 +354,24 @@ function summarizeAnalystActions(rows=[], referenceDate){
   const recent = [];
   for(const row of sorted){
     const date = dayjs(row.publishedDate || row.date || row.lastUpdated || row.effectiveDate);
+    const actionText = row.action || row.actionText || row.toGrade || row.newGrade || '';
     const days = date.isValid() ? Math.abs(reference.diff(date, 'day')) : null;
     if(days!=null){
       if(days <= 7){
-        if(/upgrade|raise/i.test(row.action || row.toGrade || '')) upgrades7++;
-        if(/downgrade|lower/i.test(row.action || row.toGrade || '')) downgrades7++;
+        if(/upgrade|raise/i.test(actionText)) upgrades7++;
+        if(/downgrade|lower/i.test(actionText)) downgrades7++;
       }
       if(days <= 30){
-        if(/upgrade|raise/i.test(row.action || row.toGrade || '')) upgrades30++;
-        if(/downgrade|lower/i.test(row.action || row.toGrade || '')) downgrades30++;
+        if(/upgrade|raise/i.test(actionText)) upgrades30++;
+        if(/downgrade|lower/i.test(actionText)) downgrades30++;
       }
     }
     if(recent.length < 6){
       recent.push({
         date: date.isValid() ? date.format('YYYY-MM-DD') : (row.date || null),
-        firm: row.firm || row.company || row.analystCompany || '',
-        action: row.action || row.toGrade || '',
-        from: row.fromGrade || row.oldGrade || '',
+        firm: row.firm || row.company || row.analystCompany || row.gradingCompany || '',
+        action: actionText,
+        from: row.fromGrade || row.oldGrade || row.previousGrade || '',
         to: row.toGrade || row.newGrade || '',
         price_target: toFloat(row.priceTarget) ?? toFloat(row.newPriceTarget)
       });
