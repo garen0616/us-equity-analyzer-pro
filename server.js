@@ -9,7 +9,7 @@ import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { getCIK, getRecentFilings } from './lib/sec.js';
 import { fetchMDA } from './lib/secText.js';
-import { getRecommendations, getEarnings, getQuote } from './lib/finnhub.js';
+import { getRecommendations, getEarnings, getQuote, getCompanyMetrics } from './lib/finnhub.js';
 import { getAggregatedPriceTarget } from './lib/pricetarget.js';
 import { analyzeWithLLM } from './lib/llm.js';
 import { getHistoricalPrice } from './lib/historicalPrice.js';
@@ -111,6 +111,13 @@ const ANALYST_ACTION_LOOKBACK_DAYS = Number(process.env.ANALYST_ACTION_LOOKBACK_
 const ANALYST_ACTION_LOOKAHEAD_DAYS = Number(process.env.ANALYST_ACTION_LOOKAHEAD_DAYS || 7);
 const ANALYST_ACTION_MAX_AGE_DAYS = Number(process.env.ANALYST_ACTION_MAX_AGE_DAYS || 540);
 const REALTIME_QUOTE_TTL_MS = Number(process.env.REALTIME_QUOTE_TTL_MS || 15) * 1000;
+const PRICE_TARGET_SAMPLE_THRESHOLD = Number(process.env.PRICE_TARGET_SAMPLE_THRESHOLD || 3);
+const MOMENTUM_STRONG_THRESHOLD = Number(process.env.MOMENTUM_STRONG_THRESHOLD || 70);
+const MOMENTUM_SEVERE_THRESHOLD = Number(process.env.MOMENTUM_SEVERE_THRESHOLD || 20);
+const WEAK_SIGNAL_TARGET_CAP = Number(process.env.WEAK_SIGNAL_TARGET_CAP || 1.25);
+const WEAK_SIGNAL_TARGET_FLOOR = Number(process.env.WEAK_SIGNAL_TARGET_FLOOR || 0.8);
+const LLM_TARGET_MAX_MULTIPLIER = Number(process.env.LLM_TARGET_MAX_MULTIPLIER || 1.8);
+const LLM_TARGET_MIN_MULTIPLIER = Number(process.env.LLM_TARGET_MIN_MULTIPLIER || 0.6);
 
 const realtimeQuoteCache = new Map();
 const analystSignalInflight = new Map();
@@ -889,7 +896,17 @@ function buildPriceTargetStats(summary){
   const monthAvg = toFloat(summary.last_month?.avg);
   const quarterAvg = toFloat(summary.last_quarter?.avg);
   const yearAvg = toFloat(summary.last_year?.avg);
-  const recentAvg = monthAvg ?? quarterAvg ?? yearAvg ?? toFloat(summary.all_time?.avg);
+  const monthCount = Number(summary.last_month?.count) || 0;
+  const quarterCount = Number(summary.last_quarter?.count) || 0;
+  const yearCount = Number(summary.last_year?.count) || 0;
+  const hasSamples = count=> count >= PRICE_TARGET_SAMPLE_THRESHOLD;
+  const recentSource = hasSamples(monthCount) && monthAvg!=null
+    ? { value: monthAvg }
+    : hasSamples(quarterCount) && quarterAvg!=null
+      ? { value: quarterAvg }
+      : hasSamples(yearCount) && yearAvg!=null
+        ? { value: yearAvg }
+        : null;
   return {
     month_avg: monthAvg,
     month_count: summary.last_month?.count ?? null,
@@ -897,7 +914,8 @@ function buildPriceTargetStats(summary){
     quarter_count: summary.last_quarter?.count ?? null,
     year_avg: yearAvg,
     year_count: summary.last_year?.count ?? null,
-    recent_avg: recentAvg
+    recent_avg: recentSource ? recentSource.value : null,
+    confidence: recentSource ? 'high' : 'low'
   };
 }
 
@@ -974,7 +992,166 @@ function buildMacroSignal(macro){
   };
 }
 
-function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analystMetrics, momentum, institutional, news, earningsCall, macro }){
+function pickFirstFinite(...values){
+  for(const value of values){
+    const num = toFloat(value);
+    if(num!=null) return num;
+  }
+  return null;
+}
+
+function enrichPriceMetaFromQuote(meta, raw){
+  if(!meta || !raw) return;
+  const yearHigh = toFloat(raw.yearHigh ?? raw['52WeekHigh']);
+  const yearLow = toFloat(raw.yearLow ?? raw['52WeekLow']);
+  if(yearHigh!=null) meta.year_high = yearHigh;
+  if(yearLow!=null) meta.year_low = yearLow;
+  const avg50 = toFloat(raw.priceAvg50);
+  const avg200 = toFloat(raw.priceAvg200);
+  if(avg50!=null || avg200!=null){
+    meta.price_averages = {
+      ma50: avg50 ?? null,
+      ma200: avg200 ?? null
+    };
+  }
+  const dayRange = {
+    high: toFloat(raw.dayHigh),
+    low: toFloat(raw.dayLow)
+  };
+  if(dayRange.high!=null || dayRange.low!=null){
+    meta.intraday = dayRange;
+  }
+  const marketCap = toFloat(raw.marketCap ?? raw.marketCapitalization);
+  if(marketCap!=null) meta.market_cap = marketCap;
+}
+
+function buildValuationSummary({ priceMeta, momentum, finnhubMetrics }){
+  if(!priceMeta && !momentum && !finnhubMetrics) return null;
+  const metric = finnhubMetrics?.metric || {};
+  const current = toFloat(priceMeta?.value);
+  const yearHigh = pickFirstFinite(priceMeta?.year_high, metric['52WeekHigh'], momentum?.range_52w?.high);
+  const yearLow = pickFirstFinite(priceMeta?.year_low, metric['52WeekLow'], momentum?.range_52w?.low);
+  const distanceFromHigh = (current!=null && yearHigh) ? (current / yearHigh) - 1 : null;
+  const distanceFromLow = (current!=null && yearLow) ? (current / yearLow) - 1 : null;
+  const atrPct = (momentum?.atr14!=null && current) ? momentum.atr14 / current : momentum?.atr_pct ?? null;
+  const evToEbitda = toFloat(metric.evEbitdaTTM ?? metric.evToEbitda ?? metric.enterpriseValueOverEBITDATTM);
+  const peg = toFloat(metric.pegTTM ?? metric.pegRatioTTM);
+  const pe = toFloat(metric.peTTM ?? metric.peBasicExclExtraTTM ?? metric.peInclExtraTTM ?? metric.peNormalizedAnnual);
+  const pb = toFloat(metric.pb ?? metric.priceToBook ?? metric.priceToBookRatio);
+  const beta = toFloat(metric.beta);
+  const relativeSp = toFloat(
+    metric['priceRelativeToS&P50052Week'] ??
+    metric['priceRelativeToS&P500Ytd']
+  );
+  const marketCap = toFloat(priceMeta?.market_cap ?? metric.marketCapitalization);
+  if(
+    current==null &&
+    yearHigh==null &&
+    yearLow==null &&
+    evToEbitda==null &&
+    peg==null &&
+    pe==null &&
+    pb==null &&
+    beta==null &&
+    atrPct==null
+  ){
+    return null;
+  }
+  return {
+    current_price: current,
+    year_high: yearHigh,
+    year_low: yearLow,
+    price_vs_high_pct: distanceFromHigh,
+    price_vs_low_pct: distanceFromLow,
+    ev_to_ebitda: evToEbitda,
+    peg,
+    pe,
+    pb,
+    beta,
+    atr_pct: atrPct,
+    relative_sp500: relativeSp,
+    market_cap: marketCap
+  };
+}
+
+function describeMomentumHint(momentum){
+  if(!momentum) return null;
+  const score = toFloat(momentum.score);
+  if(score==null) return null;
+  if(score <= MOMENTUM_SEVERE_THRESHOLD) return `動能極弱（${score}分｜${momentum.trend || '未知'}），需嚴格控管目標價。`;
+  if(score >= MOMENTUM_STRONG_THRESHOLD) return `動能偏強（${score}分｜${momentum.trend || '未知'}），可適度給予溢價。`;
+  return `動能中性（${score}分｜${momentum.trend || '未知'}）。`;
+}
+
+function describeInstitutionalHint(institutional){
+  const label = institutional?.signal?.label;
+  if(!label) return null;
+  if(label === '減碼') return '機構近況為「減碼」，偏向賣壓。';
+  if(label === '加碼') return '機構為「加碼」，籌碼支撐較佳。';
+  return `機構信號：${label}`;
+}
+
+function buildSignalHints({ momentum, institutional, valuation }){
+  const hints = [];
+  const momentumText = describeMomentumHint(momentum);
+  if(momentumText) hints.push(momentumText);
+  const instText = describeInstitutionalHint(institutional);
+  if(instText) hints.push(instText);
+  if(valuation?.price_vs_high_pct!=null){
+    hints.push(`距離 52 週高點 ${(valuation.price_vs_high_pct * 100).toFixed(1)}%`);
+  }
+  if(valuation?.price_vs_low_pct!=null){
+    hints.push(`距離 52 週低點 ${(valuation.price_vs_low_pct * 100).toFixed(1)}%`);
+  }
+  return hints.length ? hints : null;
+}
+
+function deriveGuardrails({ momentum, institutional }){
+  const score = toFloat(momentum?.score);
+  const severeMomentum = score!=null && score <= MOMENTUM_SEVERE_THRESHOLD;
+  const sellingPressure = typeof institutional?.signal?.label === 'string'
+    ? ['減碼','賣出','弱勢'].some(tag=>institutional.signal.label.includes(tag))
+    : false;
+  return {
+    severe_momentum: severeMomentum,
+    selling_pressure: sellingPressure
+  };
+}
+
+function appendRationale(text, note){
+  if(!note) return text || '';
+  return text ? `${text} ${note}` : note;
+}
+
+function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}){
+  if(!analysis?.action || !priceMeta) return;
+  const current = toFloat(priceMeta.value);
+  const target = toFloat(analysis.action.target_price);
+  if(current==null || target==null) return;
+  const confidence = (analysis.action.confidence || '').toLowerCase();
+  const weakSignals = guardrails.severe_momentum || guardrails.selling_pressure;
+  const maxCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_CAP : LLM_TARGET_MAX_MULTIPLIER);
+  const minCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_FLOOR : LLM_TARGET_MIN_MULTIPLIER);
+  let adjusted = target;
+  let clamped = false;
+  if(maxCap && adjusted > maxCap && confidence !== 'high'){
+    adjusted = maxCap;
+    clamped = true;
+  }
+  if(minCap && adjusted < minCap && confidence !== 'high'){
+    adjusted = minCap;
+    clamped = true;
+  }
+  if(clamped){
+    analysis.action.target_price = Number(adjusted.toFixed(2));
+    analysis.action.guardrail_note = weakSignals
+      ? '動能或籌碼偏弱，系統已限縮目標價。'
+      : '信心不足，系統已限縮目標價。';
+    analysis.action.rationale = appendRationale(analysis.action.rationale, '（目標價已依風控自動調整）');
+  }
+}
+
+function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analystMetrics, momentum, institutional, news, earningsCall, macro, valuation, signalHints, guardrails }){
   const filingSummaries = Array.isArray(filings)
     ? filings.slice(0, MAX_FILINGS_FOR_LLM).map(entry=>({
         form: entry.form,
@@ -1023,7 +1200,10 @@ function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analyst
     institutional: institutionalSummary,
     news: newsSummary,
     earnings_call: earningsSummary,
-    macro: macroSummary
+    macro: macroSummary,
+    valuation: valuation || null,
+    signal_hints: signalHints || null,
+    guardrails: guardrails || null
   };
 }
 
@@ -1334,6 +1514,7 @@ async function performAnalysis(ticker, date, opts={}){
             priceMeta.source = 'fmp_quote';
             if(quote.asOf) priceMeta.as_of = quote.asOf;
             cacheRealtimeQuote(upperTicker, { price: current, asOf: quote.asOf, source: 'fmp_quote' });
+            enrichPriceMetaFromQuote(priceMeta, quote.raw);
           }
         }catch(err){ console.warn('[FMP Quote]', err.message); }
       }
@@ -1359,6 +1540,7 @@ async function performAnalysis(ticker, date, opts={}){
         priceMeta.as_of = quote.asOf || priceMeta.as_of;
         priceMeta.kind = 'real-time';
         cacheRealtimeQuote(upperTicker, { price: current, asOf: quote.asOf, source: 'fmp_quote' });
+        enrichPriceMetaFromQuote(priceMeta, quote.raw);
       }catch(err){ console.warn('[FMP Quote fallback]', err.message); }
     }
     if(current==null){
@@ -1658,15 +1840,25 @@ async function performAnalysis(ticker, date, opts={}){
   })();
 
   const macroPromise = fetchMacroSnapshot(baselineDate);
+  const finnhubMetricsPromise = (async ()=>{
+    if(!FH_KEY) return null;
+    try{
+      return await getCompanyMetrics(upperTicker, FH_KEY, 'all');
+    }catch(err){
+      console.warn('[Finnhub metrics]', err.message);
+      return null;
+    }
+  })();
 
-  const [finnhubSnapshot, newsCompact, momentum, institutional, earningsCall, analystSignals, macroInsights] = await Promise.all([
+  const [finnhubSnapshot, newsCompact, momentum, institutional, earningsCall, analystSignals, macroInsights, finnhubMetrics] = await Promise.all([
     finnhubPromise,
     newsPromise,
     momentumPromise,
     institutionalPromise,
     earningsCallPromise,
     analystSignalsPromise,
-    macroPromise
+    macroPromise,
+    finnhubMetricsPromise
   ]);
 
   const priceMeta = finnhubSnapshot?.price_meta || {
@@ -1678,6 +1870,9 @@ async function performAnalysis(ticker, date, opts={}){
   const ptAgg = finnhubSnapshot?.price_target || null;
 
   const analystMetrics = buildAnalystMetrics(analystSignals);
+  const valuationSummary = buildValuationSummary({ priceMeta, momentum, finnhubMetrics });
+  const signalHints = buildSignalHints({ momentum, institutional, valuation: valuationSummary });
+  const guardrails = deriveGuardrails({ momentum, institutional });
   const llmNews = trimNewsForPayload(newsCompact, effectiveNewsLimit);
   const llmPayload = buildNumericPayload({
     ticker: upperTicker,
@@ -1689,7 +1884,10 @@ async function performAnalysis(ticker, date, opts={}){
     institutional,
     news: llmNews,
     earningsCall,
-    macro: macroInsights
+    macro: macroInsights,
+    valuation: valuationSummary,
+    signalHints,
+    guardrails
   });
   let llm = null;
   let llmUsage = null;
@@ -1706,6 +1904,7 @@ async function performAnalysis(ticker, date, opts={}){
     });
     llmUsage = llm?.__usage || null;
     if(llmUsage) recordUsage(llmUsage);
+    applyTargetPriceGuardrails(llm, priceMeta, guardrails);
   }
 
   const result = {

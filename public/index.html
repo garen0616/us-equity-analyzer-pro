@@ -358,19 +358,60 @@ function formatGrowthLabel(value){
   return `${(num*100).toFixed(1)}%`;
 }
 
+const PRICE_TARGET_SAMPLE_THRESHOLD = 3;
+
+function ensurePriceTargetConfidence(targets){
+  if(!targets) return null;
+  if(targets.confidence){
+    return targets;
+  }
+  const counts = [
+    Number(targets.month_count) || 0,
+    Number(targets.quarter_count) || 0,
+    Number(targets.year_count) || 0
+  ];
+  const hasSamples = counts.some(count=>count >= PRICE_TARGET_SAMPLE_THRESHOLD);
+  const normalized = { ...targets };
+  normalized.confidence = hasSamples ? 'high' : 'low';
+  if(!hasSamples){
+    normalized.recent_avg = null;
+  }
+  return normalized;
+}
+
 function normalizeAnalystMetrics(source){
   if(!source) return null;
   if(source.price_targets || source.estimates || source.rating || source.grades){
+    if(source.price_targets){
+      source.price_targets = ensurePriceTargetConfidence(source.price_targets);
+    }
     return source;
   }
   const summary = source.price_target_summary || {};
+  const monthAvg = toNum(summary.last_month?.avg);
+  const quarterAvg = toNum(summary.last_quarter?.avg);
+  const yearAvg = toNum(summary.last_year?.avg);
+  const monthCount = Number(summary.last_month?.count) || 0;
+  const quarterCount = Number(summary.last_quarter?.count) || 0;
+  const yearCount = Number(summary.last_year?.count) || 0;
+  const hasSamples = count=>count >= PRICE_TARGET_SAMPLE_THRESHOLD;
+  let recentAvg = null;
+  if(hasSamples(monthCount) && monthAvg!=null){
+    recentAvg = monthAvg;
+  }else if(hasSamples(quarterCount) && quarterAvg!=null){
+    recentAvg = quarterAvg;
+  }else if(hasSamples(yearCount) && yearAvg!=null){
+    recentAvg = yearAvg;
+  }
   const priceTargets = (summary.last_month || summary.last_quarter || summary.last_year) ? {
-    month_avg: toNum(summary.last_month?.avg),
+    month_avg: monthAvg,
     month_count: summary.last_month?.count ?? null,
-    quarter_avg: toNum(summary.last_quarter?.avg),
+    quarter_avg: quarterAvg,
     quarter_count: summary.last_quarter?.count ?? null,
-    year_avg: toNum(summary.last_year?.avg),
-    year_count: summary.last_year?.count ?? null
+    year_avg: yearAvg,
+    year_count: summary.last_year?.count ?? null,
+    recent_avg: recentAvg,
+    confidence: recentAvg!=null ? 'high' : 'low'
   } : null;
   const estQuarter = Array.isArray(source.estimates?.quarterly) ? source.estimates.quarterly[0] : null;
   const estAnnual = Array.isArray(source.estimates?.annual) ? source.estimates.annual[0] : null;
@@ -804,6 +845,9 @@ function renderAnalystSignals(rawData){
     summaryParts.push(`近年 ${formatUsd(data.price_targets.year_avg)} (${data.price_targets.year_count ?? 0}筆)`);
   }
   appendLine(analystSummaryEl, summaryParts.length ? summaryParts.join(' ｜ ') : '目標價資料有限，僅供參考。', summaryParts.length ? '' : 'muted');
+  if(data.price_targets?.confidence === 'low'){
+    appendLine(analystSummaryEl, '分析師樣本少於 3 筆，僅供參考。', 'muted');
+  }
 
   const detailLines = [];
   if(data.rating){
