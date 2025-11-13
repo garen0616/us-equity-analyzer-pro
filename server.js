@@ -1127,6 +1127,19 @@ function appendRationale(text, note){
   return text ? `${text} ${note}` : note;
 }
 
+function blendTargetWithConsensus(analysis, consensusAvg){
+  if(!analysis?.action) return;
+  const llmTarget = toFloat(analysis.action.target_price);
+  const consensus = toFloat(consensusAvg);
+  if(llmTarget==null || consensus==null) return;
+  const weighted = (0.6 * llmTarget) + (0.4 * consensus);
+  analysis.action.target_price = Number(weighted.toFixed(2));
+  analysis.action.rationale = appendRationale(
+    analysis.action.rationale,
+    `（已與分析師近月均價 ${consensus.toFixed(2)} 做 60/40 加權）`
+  );
+}
+
 function classifyRecommendation(rating=''){
   if(!rating) return null;
   const normalized = rating.toString().toLowerCase();
@@ -1134,6 +1147,18 @@ function classifyRecommendation(rating=''){
   if(/(sell|short|underperform|reduce|減持|賣)/.test(normalized)) return 'bearish';
   if(/(hold|neutral|market perform|equal weight|觀望|持有)/.test(normalized)) return 'neutral';
   return null;
+}
+
+function getConsensusTargetAvg(analystSignals){
+  if(!analystSignals?.price_target_summary) return null;
+  const summary = analystSignals.price_target_summary;
+  return toFloat(
+    summary.last_month?.avg ??
+    summary.last_quarter?.avg ??
+    summary.last_year?.avg ??
+    summary.all_time?.avg ??
+    null
+  );
 }
 
 function ensureActionRationale(analysis, { priceMeta, signalHints }={}){
@@ -1186,18 +1211,42 @@ function enforceActionConsistency(analysis, priceMeta){
   }
 }
 
-function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}){
+function applyRatingTightRange(analysis, priceMeta){
+  if(!analysis?.action) return;
+  const stance = classifyRecommendation(analysis.action.rating);
+  if(!stance || (stance !== 'neutral' && stance !== 'bearish')) return;
+  const current = toFloat(priceMeta?.value);
+  const target = toFloat(analysis.action.target_price);
+  if(current==null || target==null) return;
+  const upper = current * 1.10;
+  const lower = current * 0.90;
+  if(target > upper){
+    analysis.action.target_price = Number(upper.toFixed(2));
+    analysis.action.rationale = appendRationale(analysis.action.rationale, '（評級為中性/保守，目標價已收斂至 ±10%）');
+    analysis.action.consistency_flag = 'needs_review';
+  }else if(target < lower){
+    analysis.action.target_price = Number(lower.toFixed(2));
+    analysis.action.rationale = appendRationale(analysis.action.rationale, '（評級為中性/保守，目標價已收斂至 ±10%）');
+    analysis.action.consistency_flag = 'needs_review';
+  }
+}
+
+function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}, { consensusAvg }={}){
   if(!analysis?.action || !priceMeta) return;
   const current = toFloat(priceMeta.value);
   const target = toFloat(analysis.action.target_price);
   if(current==null || target==null) return;
   const confidence = (analysis.action.confidence || '').toLowerCase();
   const weakSignals = guardrails.severe_momentum || guardrails.selling_pressure;
-  const maxCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_CAP : LLM_TARGET_MAX_MULTIPLIER);
+  const capCandidates = [];
+  if(Number.isFinite(current)) capCandidates.push(current * 1.35);
+  if(Number.isFinite(consensusAvg)) capCandidates.push(consensusAvg * 1.25);
+  if(weakSignals && Number.isFinite(current)) capCandidates.push(current * WEAK_SIGNAL_TARGET_CAP);
+  const maxCap = capCandidates.length ? Math.min(...capCandidates.filter(val=>Number.isFinite(val) && val>0)) : null;
   const minCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_FLOOR : LLM_TARGET_MIN_MULTIPLIER);
   let adjusted = target;
   let clamped = false;
-  if(maxCap && adjusted > maxCap && confidence !== 'high'){
+  if(maxCap && adjusted > maxCap){
     adjusted = maxCap;
     clamped = true;
   }
@@ -1936,6 +1985,7 @@ async function performAnalysis(ticker, date, opts={}){
   const valuationSummary = buildValuationSummary({ priceMeta, momentum, finnhubMetrics });
   const signalHints = buildSignalHints({ momentum, institutional, valuation: valuationSummary });
   const guardrails = deriveGuardrails({ momentum, institutional });
+  const consensusAvg = getConsensusTargetAvg(analystSignals);
   const llmNews = trimNewsForPayload(newsCompact, effectiveNewsLimit);
   const llmPayload = buildNumericPayload({
     ticker: upperTicker,
@@ -1967,9 +2017,11 @@ async function performAnalysis(ticker, date, opts={}){
     });
     llmUsage = llm?.__usage || null;
     if(llmUsage) recordUsage(llmUsage);
-    applyTargetPriceGuardrails(llm, priceMeta, guardrails);
+    blendTargetWithConsensus(llm, consensusAvg);
+    applyTargetPriceGuardrails(llm, priceMeta, guardrails, { consensusAvg });
   }
   if(llm){
+    applyRatingTightRange(llm, priceMeta);
     ensureActionRationale(llm, { priceMeta, signalHints });
     enforceActionConsistency(llm, priceMeta);
   }
