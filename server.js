@@ -1127,17 +1127,28 @@ function appendRationale(text, note){
   return text ? `${text} ${note}` : note;
 }
 
-function blendTargetWithConsensus(analysis, consensusAvg){
+function blendTargetWithConsensus(analysis, consensusAvg, baselinePrice){
   if(!analysis?.action) return;
   const llmTarget = toFloat(analysis.action.target_price);
   const consensus = toFloat(consensusAvg);
-  if(llmTarget==null || consensus==null) return;
-  const weighted = (0.6 * llmTarget) + (0.4 * consensus);
+  const baseline = toFloat(baselinePrice);
+  const components = [];
+  if(llmTarget!=null) components.push({ value: llmTarget, weight: 0.5 });
+  if(consensus!=null) components.push({ value: consensus, weight: 0.3 });
+  if(baseline!=null) components.push({ value: baseline, weight: 0.2 });
+  if(components.length < 2) return;
+  const weightSum = components.reduce((sum, comp)=> sum + comp.weight, 0);
+  const weighted = components.reduce((sum, comp)=> sum + comp.value * comp.weight, 0) / weightSum;
   analysis.action.target_price = Number(weighted.toFixed(2));
-  analysis.action.rationale = appendRationale(
-    analysis.action.rationale,
-    `（已與分析師近月均價 ${consensus.toFixed(2)} 做 60/40 加權）`
-  );
+  const parts = [];
+  if(consensus!=null) parts.push(`分析師均價 ${consensus.toFixed(2)}`);
+  if(baseline!=null) parts.push(`現價 ${baseline.toFixed(2)}`);
+  if(parts.length){
+    analysis.action.rationale = appendRationale(
+      analysis.action.rationale,
+      `（已與 ${parts.join(' / ')} 做加權平均）`
+    );
+  }
 }
 
 function classifyRecommendation(rating=''){
@@ -1260,6 +1271,53 @@ function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}, { consen
       ? '動能或籌碼偏弱，系統已限縮目標價。'
       : '信心不足，系統已限縮目標價。';
     analysis.action.rationale = appendRationale(analysis.action.rationale, '（目標價已依風控自動調整）');
+  }
+}
+
+function applySmallCapGuardrail(analysis, priceMeta){
+  if(!analysis?.action) return;
+  const current = toFloat(priceMeta?.value);
+  if(current==null || current >= 20) return;
+  const target = toFloat(analysis.action.target_price);
+  if(target==null) return;
+  const cap = current * 1.15;
+  if(target > cap){
+    analysis.action.target_price = Number(cap.toFixed(2));
+    analysis.action.rationale = appendRationale(analysis.action.rationale, '（小型/低價股目標價限制在 ±15%）');
+    analysis.action.consistency_flag = 'needs_review';
+  }
+}
+
+function adjustRatingForSignals(analysis, { priceMeta, guardrails, momentum }={}){
+  if(!analysis?.action) return;
+  const current = toFloat(priceMeta?.value);
+  if(current==null) return;
+  const target = toFloat(analysis.action.target_price);
+  const stance = classifyRecommendation(analysis.action.rating);
+  const score = toFloat(momentum?.score);
+  const severe = guardrails?.severe_momentum || guardrails?.selling_pressure;
+  const degrade = (newRating, reason)=>{
+    if(!newRating || analysis.action.rating === newRating) return;
+    analysis.action.rating = newRating;
+    analysis.action.rationale = appendRationale(analysis.action.rationale, `（${reason}）`);
+    analysis.action.consistency_flag = 'needs_review';
+  };
+  if(target!=null && target <= current * 0.95){
+    degrade('SELL', '目標價低於現價，建議減碼');
+    return;
+  }
+  if(score!=null){
+    if(score <= 25){
+      degrade('SELL', `動能極弱（${score}分），建議出場`);
+    }else if(score <= 40 && stance === 'bullish'){
+      degrade('HOLD', `動能不足（${score}分），改為觀望`);
+    }
+  }
+  if(severe && stance === 'bullish'){
+    degrade('HOLD', '動能或籌碼偏弱，自動調降評級');
+  }
+  if(current < 10 && stance === 'bullish'){
+    degrade('HOLD', '低價股易受波動影響，改採保守建議');
   }
 }
 
@@ -2017,10 +2075,12 @@ async function performAnalysis(ticker, date, opts={}){
     });
     llmUsage = llm?.__usage || null;
     if(llmUsage) recordUsage(llmUsage);
-    blendTargetWithConsensus(llm, consensusAvg);
+    blendTargetWithConsensus(llm, consensusAvg, priceMeta?.value);
     applyTargetPriceGuardrails(llm, priceMeta, guardrails, { consensusAvg });
   }
   if(llm){
+    applySmallCapGuardrail(llm, priceMeta);
+    adjustRatingForSignals(llm, { priceMeta, guardrails, momentum });
     applyRatingTightRange(llm, priceMeta);
     ensureActionRationale(llm, { priceMeta, signalHints });
     enforceActionConsistency(llm, priceMeta);
