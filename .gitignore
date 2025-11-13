@@ -13,3 +13,4 @@ dist/
 tmp/
 *.swp
 .DS_Store
+output/
