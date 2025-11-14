@@ -11,6 +11,9 @@ const MAX_ACTUAL_LOOKAHEAD_DAYS = Number(process.env.BACKTEST_ACTUAL_LOOKAHEAD_D
 const BASELINE_START = process.env.BACKTEST_START_DATE || '2024-01-01';
 const BASELINE_END = process.env.BACKTEST_END_DATE || '2025-11-01';
 const TICKERS = (process.env.BACKTEST_TICKERS || 'NVDA,AAPL,MSFT,AMZN,GOOGL').split(',').map(s=>s.trim()).filter(Boolean);
+const PARTIAL_MOVE_THRESHOLD = Number(process.env.BACKTEST_PARTIAL_THRESHOLD || 0.05);
+const BACKTEST_MODE = (process.env.BACKTEST_MODE || 'build').toLowerCase();
+const USE_RESET_CACHE = BACKTEST_MODE === 'build';
 
 function* generateMonthlyDates(startStr, endStr){
   let cursor = dayjs(startStr);
@@ -30,16 +33,28 @@ function classifyRating(rating){
   return null;
 }
 
+function normalizeBandValue(raw, segment){
+  let v = Number(raw);
+  if(!Number.isFinite(v) || v <= 0) return null;
+  if(v > 1) v = v / 100;
+  const isSmallCap = (segment || '').toLowerCase() === 'small_cap';
+  const min = isSmallCap ? 0.03 : 0.02;
+  const max = isSmallCap ? 0.07 : 0.05;
+  if(v < min) v = min;
+  if(v > max) v = max;
+  return v;
+}
+
 function resolveBandPct(action, segment){
   const band = action?.target_band || {};
   const candidates = [
-    Number(band.band_pct),
-    Math.abs(Number(band.upper_pct)),
-    Math.abs(Number(band.lower_pct))
+    normalizeBandValue(band.band_pct, segment),
+    normalizeBandValue(band.upper_pct, segment),
+    normalizeBandValue(band.lower_pct, segment)
   ].filter(val=>Number.isFinite(val) && val>0);
   if(candidates.length) return Math.max(...candidates);
-  if((segment || '').toLowerCase() === 'small_cap') return 0.07;
-  return 0.05;
+  const isSmallCap = (segment || '').toLowerCase() === 'small_cap';
+  return isSmallCap ? 0.06 : 0.04;
 }
 
 async function callApi(path, payload){
@@ -55,62 +70,49 @@ async function callApi(path, payload){
   return res.json();
 }
 
-async function fetchActualPrice(symbol, targetDate){
-  let cursor = dayjs(targetDate);
-  for(let attempt=0; attempt<=MAX_ACTUAL_LOOKAHEAD_DAYS; attempt++){
-    const queryDate = cursor.format('YYYY-MM-DD');
-    const url = new URL('https://financialmodelingprep.com/stable/historical-price-eod/light');
-    url.searchParams.set('symbol', symbol);
-    url.searchParams.set('from', queryDate);
-    url.searchParams.set('to', queryDate);
-    url.searchParams.set('apikey', FMP_KEY);
-    try{
-      const res = await fetch(url);
-      if(!res.ok){
-        throw new Error(String(res.status));
-      }
-      const data = await res.json();
-      const rows = Array.isArray(data?.historical) ? data.historical : Array.isArray(data) ? data : [];
-      if(rows.length){
-        const match = rows.find(r=>r.date===queryDate) || rows[0];
-        const price = match?.close ?? match?.price ?? match?.open;
-        if(Number.isFinite(price)) return { price, asOf: queryDate };
-      }
-    }catch(err){
-      console.warn('[fetchActualPrice]', symbol, queryDate, err.message);
-    }
-    cursor = cursor.add(1,'day');
-  }
-  return { price: null, asOf: null };
-}
+const monthlyCache = new Map();
 
-async function fetchMonthlyRange(symbol, baselineDate){
+async function fetchMonthlyStats(symbol, baselineDate){
   const monthStart = dayjs(baselineDate).add(1,'month').startOf('month');
   const monthEnd = monthStart.endOf('month');
+  const cacheKey = `${symbol}_${monthStart.format('YYYY-MM')}`;
+  if(monthlyCache.has(cacheKey)) return monthlyCache.get(cacheKey);
   const url = new URL('https://financialmodelingprep.com/stable/historical-price-eod/light');
   url.searchParams.set('symbol', symbol);
   url.searchParams.set('from', monthStart.format('YYYY-MM-DD'));
   url.searchParams.set('to', monthEnd.format('YYYY-MM-DD'));
   url.searchParams.set('apikey', FMP_KEY);
+  let payload = { rows: [], monthHigh:null, monthLow:null, rangeMid:null, avgClose:null };
   try{
     const res = await fetch(url);
     if(!res.ok) throw new Error(String(res.status));
     const data = await res.json();
-    const rows = Array.isArray(data?.historical) ? data.historical : Array.isArray(data) ? data : [];
+    const rowsRaw = Array.isArray(data?.historical) ? data.historical : Array.isArray(data) ? data : [];
+    const rows = rowsRaw
+      .map(row=>({
+        date: row.date,
+        close: Number(row.close ?? row.price ?? row.open ?? null),
+        high: Number(row.high ?? row.close ?? row.price ?? null),
+        low: Number(row.low ?? row.close ?? row.price ?? null)
+      }))
+      .filter(row=>row.date && Number.isFinite(row.close));
+    rows.sort((a,b)=> dayjs(a.date).valueOf() - dayjs(b.date).valueOf());
     let monthHigh = null;
     let monthLow = null;
+    let sumClose = 0;
     rows.forEach(row=>{
-      const high = Number(row.high ?? row.close ?? row.price);
-      const low = Number(row.low ?? row.close ?? row.price);
-      if(Number.isFinite(high)) monthHigh = monthHigh==null ? high : Math.max(monthHigh, high);
-      if(Number.isFinite(low)) monthLow = monthLow==null ? low : Math.min(monthLow, low);
+      if(Number.isFinite(row.high)) monthHigh = monthHigh==null ? row.high : Math.max(monthHigh, row.high);
+      if(Number.isFinite(row.low)) monthLow = monthLow==null ? row.low : Math.min(monthLow, row.low);
+      sumClose += row.close;
     });
     const rangeMid = (monthHigh!=null && monthLow!=null) ? (monthHigh + monthLow) / 2 : null;
-    return { monthHigh, monthLow, rangeMid };
+    const avgClose = rows.length ? sumClose / rows.length : null;
+    payload = { rows, monthHigh, monthLow, rangeMid, avgClose };
   }catch(err){
-    console.warn('[fetchMonthlyRange]', symbol, baselineDate, err.message);
-    return { monthHigh:null, monthLow:null, rangeMid:null };
+    console.warn('[fetchMonthlyStats]', symbol, baselineDate, err.message);
   }
+  monthlyCache.set(cacheKey, payload);
+  return payload;
 }
 
 function appendRow(rows, row){
@@ -120,7 +122,7 @@ function appendRow(rows, row){
 }
 
 function exportCsv(rows){
-  const header = 'ticker,baselineDate,nextDate,rating,target,actual,actual_date,delta_pct,baseline_price,month_high,month_low,range_mid,close_hit,range_mid_hit,intramonth_hit,hold_accuracy,hold_band_pct,hold_drift_flag\n';
+  const header = 'ticker,baselineDate,nextDate,rating,target,actual,actual_date,delta_pct,baseline_price,month_high,month_low,range_mid,ma_avg,close_hit,range_mid_hit,intramonth_hit,ma_hit,partial_hit,hold_accuracy,hold_band_pct,hold_drift_flag\n';
   const data = rows.map(r=>[
     r.ticker,
     r.baselineDate,
@@ -134,14 +136,52 @@ function exportCsv(rows){
     r.monthHigh ?? '',
     r.monthLow ?? '',
     r.rangeMid ?? '',
+    r.maAverage ?? '',
     r.closeHit ?? '',
     r.rangeMidHit ?? '',
     r.intramonthHit ?? '',
+    r.maHit ?? '',
+    r.partialHit ?? '',
     r.holdAccuracy ?? '',
     r.holdBandPct ?? '',
     r.holdDriftFlag ?? ''
   ].join(','));
   fs.writeFileSync(OUTPUT_CSV, header + data.join('\n'));
+}
+
+function createMetric(){ return { hit:0, total:0 }; }
+function updateMetric(metric, value){
+  if(metric && value!==null && value!==undefined){
+    metric.total += 1;
+    if(value === true) metric.hit += 1;
+  }
+}
+function summarizeMetrics(rows){
+  const metrics = {
+    close: createMetric(),
+    rangeMid: createMetric(),
+    intramonth: createMetric(),
+    ma: createMetric(),
+    partial: createMetric(),
+    hold: createMetric()
+  };
+  rows.forEach(row=>{
+    updateMetric(metrics.close, row.closeHit);
+    updateMetric(metrics.rangeMid, row.rangeMidHit);
+    updateMetric(metrics.intramonth, row.intramonthHit);
+    updateMetric(metrics.ma, row.maHit);
+    updateMetric(metrics.partial, row.partialHit);
+    updateMetric(metrics.hold, row.holdAccuracy);
+  });
+  return metrics;
+}
+function formatMetric(metric){
+  if(!metric || !metric.total) return '0/0 (n/a)';
+  return `${metric.hit}/${metric.total} (${(metric.hit / metric.total * 100).toFixed(1)}%)`;
+}
+function logMetrics(label, rows){
+  const metrics = summarizeMetrics(rows);
+  console.log(`[stats] ${label} -> close ${formatMetric(metrics.close)}, rangeMid ${formatMetric(metrics.rangeMid)}, intramonth ${formatMetric(metrics.intramonth)}, MA ${formatMetric(metrics.ma)}, partial ${formatMetric(metrics.partial)}, hold ${formatMetric(metrics.hold)}`);
 }
 
 async function main(){
@@ -158,7 +198,9 @@ async function main(){
       const key = `${ticker}_${baselineDate}`;
       if(processed.has(key)) continue;
       try{
-        await callApi('/api/reset-cache',{ ticker, date: baselineDate });
+        if(USE_RESET_CACHE){
+          await callApi('/api/reset-cache',{ ticker, date: baselineDate });
+        }
         const analysis = await callApi('/api/analyze',{ ticker, date: baselineDate });
         const action = analysis?.analysis?.action || {};
         const target = Number(action.target_price) ?? null;
@@ -168,16 +210,15 @@ async function main(){
         const direction = classifyRating(rating);
         const bandPct = resolveBandPct(action, profile.segment);
         const nextDate = dayjs(baselineDate).add(1,'month').format('YYYY-MM-DD');
-        const [{ price: actual, asOf: actualDate }, rangeStats] = await Promise.all([
-          fetchActualPrice(ticker, nextDate),
-          fetchMonthlyRange(ticker, baselineDate)
-        ]);
+        const monthStats = await fetchMonthlyStats(ticker, baselineDate);
+        const { price: actual, asOf: actualDate } = resolveActualFromRows(monthStats.rows, nextDate);
         const delta = (actual!=null && target!=null)
           ? ((actual - target) / target) * 100
           : null;
-        const monthHigh = rangeStats.monthHigh!=null ? Number(rangeStats.monthHigh.toFixed(2)) : null;
-        const monthLow = rangeStats.monthLow!=null ? Number(rangeStats.monthLow.toFixed(2)) : null;
-        const rangeMid = rangeStats.rangeMid!=null ? Number(rangeStats.rangeMid.toFixed(2)) : null;
+        const monthHigh = monthStats.monthHigh!=null ? Number(monthStats.monthHigh.toFixed(2)) : null;
+        const monthLow = monthStats.monthLow!=null ? Number(monthStats.monthLow.toFixed(2)) : null;
+        const rangeMid = monthStats.rangeMid!=null ? Number(monthStats.rangeMid.toFixed(2)) : null;
+        const maAverage = monthStats.avgClose!=null ? Number(monthStats.avgClose.toFixed(2)) : null;
         const closeHit = (()=>{
           if(actual==null || baselinePrice==null) return null;
           if(direction === 'bullish') return actual >= baselinePrice;
@@ -206,6 +247,25 @@ async function main(){
           }
           return null;
         })();
+        const maHit = (()=>{
+          if(maAverage==null || baselinePrice==null) return null;
+          if(direction === 'bullish') return maAverage >= baselinePrice;
+          if(direction === 'bearish') return maAverage <= baselinePrice;
+          if(direction === 'neutral' && Number.isFinite(bandPct)){
+            return Math.abs((maAverage - baselinePrice) / baselinePrice) <= bandPct;
+          }
+          return null;
+        })();
+        const partialHit = (()=>{
+          if(baselinePrice==null) return null;
+          if(direction === 'bullish'){
+            return monthHigh!=null ? monthHigh >= baselinePrice * (1 + PARTIAL_MOVE_THRESHOLD) : null;
+          }
+          if(direction === 'bearish'){
+            return monthLow!=null ? monthLow <= baselinePrice * (1 - PARTIAL_MOVE_THRESHOLD) : null;
+          }
+          return null;
+        })();
         const holdAccuracy = direction === 'neutral' ? closeHit : null;
         const holdDriftFlag = direction === 'neutral' && actual!=null && baselinePrice!=null
           ? Math.abs((actual - baselinePrice) / baselinePrice) > 0.10
@@ -224,9 +284,12 @@ async function main(){
           monthHigh,
           monthLow,
           rangeMid,
+          maAverage,
           closeHit,
           rangeMidHit,
           intramonthHit,
+          maHit,
+          partialHit,
           holdAccuracy,
           holdBandPct: Number.isFinite(bandPct) ? bandPct : null,
           holdDriftFlag
@@ -239,9 +302,21 @@ async function main(){
         console.warn('[backtest] failed', ticker, baselineDate, err.message);
       }
     }
+    const tickerRows = rows.filter(r=>r.ticker === ticker);
+    logMetrics(ticker, tickerRows);
   }
   exportCsv(rows);
+  logMetrics('Overall', rows);
   console.log('Backtest completed. Rows:', rows.length);
 }
 
 main();
+function resolveActualFromRows(rows, targetDate){
+  if(!Array.isArray(rows) || !rows.length) return { price:null, asOf:null };
+  const exact = rows.find(row=>row.date === targetDate);
+  if(exact) return { price: exact.close, asOf: exact.date };
+  const target = dayjs(targetDate);
+  const fallback = rows.find(row=>dayjs(row.date).isAfter(target) || dayjs(row.date).isSame(target, 'day'));
+  if(fallback) return { price: fallback.close, asOf: fallback.date };
+  return { price: rows[rows.length-1].close, asOf: rows[rows.length-1].date };
+}

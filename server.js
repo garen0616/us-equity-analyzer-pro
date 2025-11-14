@@ -32,6 +32,7 @@ import {
   getFmpInsiderTrading,
   getFmpInsiderStats,
   getFmpAnalystActions,
+  getFmpProfile,
   getFmpEconomicCalendar,
   getFmpTreasuryCurve,
   getFmpMarketRiskPremium
@@ -121,8 +122,10 @@ const WEAK_SIGNAL_TARGET_CAP = Number(process.env.WEAK_SIGNAL_TARGET_CAP || 1.25
 const WEAK_SIGNAL_TARGET_FLOOR = Number(process.env.WEAK_SIGNAL_TARGET_FLOOR || 0.8);
 const LLM_TARGET_MAX_MULTIPLIER = Number(process.env.LLM_TARGET_MAX_MULTIPLIER || 1.8);
 const LLM_TARGET_MIN_MULTIPLIER = Number(process.env.LLM_TARGET_MIN_MULTIPLIER || 0.6);
-const HOLD_BAND_BASE = Number(process.env.HOLD_BAND_BASE || 0.05);
-const HOLD_BAND_SMALL_CAP = Number(process.env.HOLD_BAND_SMALL_CAP || 0.07);
+const HOLD_BAND_BASE = Number(process.env.HOLD_BAND_BASE || 0.04);
+const HOLD_BAND_SMALL_CAP = Number(process.env.HOLD_BAND_SMALL_CAP || 0.06);
+const BEARISH_TARGET_CAP_MULTIPLIER = Number(process.env.BEARISH_TARGET_CAP_MULTIPLIER || 0.85);
+const BEARISH_TARGET_CONSENSUS_MULTIPLIER = Number(process.env.BEARISH_TARGET_CONSENSUS_MULTIPLIER || 0.9);
 
 const realtimeQuoteCache = new Map();
 const analystSignalInflight = new Map();
@@ -1124,6 +1127,54 @@ function deriveGuardrails({ momentum, institutional }){
   };
 }
 
+function resolveSectorRiskProfile(sector){
+  const sec = String(sector || '').toLowerCase();
+  const base = {
+    max_up: 1.35,
+    consensus_up: 1.25,
+    min_down: LLM_TARGET_MIN_MULTIPLIER,
+    bearish_cap: BEARISH_TARGET_CAP_MULTIPLIER,
+    bearish_consensus_cap: BEARISH_TARGET_CONSENSUS_MULTIPLIER
+  };
+  if(['technology','communication services'].includes(sec)){
+    return {
+      max_up: 1.5,
+      consensus_up: 1.3,
+      min_down: 0.55,
+      bearish_cap: 0.8,
+      bearish_consensus_cap: 0.85
+    };
+  }
+  if(['consumer defensive','utilities','real estate'].includes(sec)){
+    return {
+      max_up: 1.25,
+      consensus_up: 1.15,
+      min_down: 0.75,
+      bearish_cap: 0.9,
+      bearish_consensus_cap: 0.92
+    };
+  }
+  if(['energy','basic materials'].includes(sec)){
+    return {
+      max_up: 1.35,
+      consensus_up: 1.2,
+      min_down: 0.65,
+      bearish_cap: 0.8,
+      bearish_consensus_cap: 0.85
+    };
+  }
+  if(['financial services'].includes(sec)){
+    return {
+      max_up: 1.3,
+      consensus_up: 1.2,
+      min_down: 0.7,
+      bearish_cap: 0.85,
+      bearish_consensus_cap: 0.9
+    };
+  }
+  return base;
+}
+
 function appendRationale(text, note){
   if(!note) return text || '';
   return text ? `${text} ${note}` : note;
@@ -1175,29 +1226,47 @@ function deriveBandPct(targetBand){
   return Math.max(...candidates.filter(val=>val>0));
 }
 
+function normalizeBandValue(raw, isSmallCap){
+  let v = Number(raw);
+  if(!Number.isFinite(v) || v <= 0) return null;
+  if(v > 1) v = v / 100;
+  const min = isSmallCap ? 0.03 : 0.02;
+  const max = isSmallCap ? 0.07 : 0.05;
+  if(v < min) v = min;
+  if(v > max) v = max;
+  return v;
+}
+
 function resolveHoldBandPct(analysis, priceMeta){
   if(!analysis?.action) return null;
-  const existing = deriveBandPct(analysis.action.target_band);
-  if(Number.isFinite(existing) && existing > 0) return existing;
   const segment = (analysis.profile?.segment || '').toLowerCase();
-  if(segment === 'small_cap') return HOLD_BAND_SMALL_CAP;
+  const isSmallCap = segment === 'small_cap';
+  const existingRaw = deriveBandPct(analysis.action.target_band);
+  const existing = normalizeBandValue(existingRaw, isSmallCap);
+  if(Number.isFinite(existing) && existing > 0) return existing;
   const current = toFloat(priceMeta?.value);
-  if(current!=null && current < 15) return HOLD_BAND_SMALL_CAP;
-  return HOLD_BAND_BASE;
+  if(current!=null && current < 15){
+    return normalizeBandValue(HOLD_BAND_SMALL_CAP, true);
+  }
+  return normalizeBandValue(HOLD_BAND_BASE, isSmallCap) ?? HOLD_BAND_BASE;
 }
 
 function ensureTargetBand(analysis, priceMeta, bandPct){
   if(!analysis?.action) return null;
   const current = toFloat(priceMeta?.value);
-  const base = Number.isFinite(bandPct) && bandPct > 0 ? bandPct : HOLD_BAND_BASE;
+  const segment = (analysis.profile?.segment || '').toLowerCase();
+  const isSmallCap = segment === 'small_cap';
+  const base = normalizeBandValue(bandPct, isSmallCap) ?? normalizeBandValue(isSmallCap ? HOLD_BAND_SMALL_CAP : HOLD_BAND_BASE, isSmallCap) ?? HOLD_BAND_BASE;
   const existing = analysis.action.target_band || {};
-  const upperPct = Number.isFinite(existing.upper_pct) ? Math.abs(existing.upper_pct) : base;
-  const lowerPct = Number.isFinite(existing.lower_pct) ? -Math.abs(existing.lower_pct) : -base;
-  const finalBandPct = Math.max(upperPct, Math.abs(lowerPct));
+  const rawUpper = Number.isFinite(existing.upper_pct) ? existing.upper_pct : base;
+  const rawLower = Number.isFinite(existing.lower_pct) ? Math.abs(existing.lower_pct) : base;
+  const upperPct = normalizeBandValue(rawUpper, isSmallCap) ?? base;
+  const lowerPct = normalizeBandValue(rawLower, isSmallCap) ?? base;
+  const finalBandPct = Math.max(upperPct, lowerPct);
   const struct = {
     reason: existing.reason || '上下空間有限，維持觀望',
     upper_pct: upperPct,
-    lower_pct: lowerPct,
+    lower_pct: -lowerPct,
     band_pct: finalBandPct
   };
   if(Number.isFinite(current)){
@@ -1218,6 +1287,18 @@ function applyHoldBand(analysis, priceMeta){
   const band = ensureTargetBand(analysis, priceMeta, bandPct);
   let stance = classifyRecommendation(analysis.action.rating);
   const deltaPct = Math.abs(target - current) / current;
+  // 若原先評為 HOLD 但目標價超出 band，就不應維持 HOLD
+  if(stance === 'neutral' && deltaPct > band.band_pct){
+    if(target >= current * (1 + band.band_pct)){
+      analysis.action.rating = 'BUY';
+      analysis.action.rationale = appendRationale(analysis.action.rationale, `（目標價已超出 HOLD 區間，上調為 BUY）`);
+    }else if(target <= current * (1 - band.band_pct)){
+      analysis.action.rating = 'SELL';
+      analysis.action.rationale = appendRationale(analysis.action.rationale, `（目標價已跌破 HOLD 區間，下調為 SELL）`);
+    }
+    analysis.action.consistency_flag = 'needs_review';
+    stance = classifyRecommendation(analysis.action.rating);
+  }
   if(deltaPct <= band.band_pct && stance && stance !== 'neutral'){
     analysis.action.rating = 'HOLD';
     analysis.action.rationale = appendRationale(analysis.action.rationale, `（上下空間僅 ±${(band.band_pct*100).toFixed(1)}%，自動標記為 HOLD）`);
@@ -1347,19 +1428,30 @@ function applyRatingTightRange(analysis, priceMeta){
   }
 }
 
-function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}, { consensusAvg }={}){
+function applyTargetPriceGuardrails(analysis, priceMeta, guardrails={}, { consensusAvg, sector }={}){
   if(!analysis?.action || !priceMeta) return;
   const current = toFloat(priceMeta.value);
   const target = toFloat(analysis.action.target_price);
   if(current==null || target==null) return;
   const confidence = (analysis.action.confidence || '').toLowerCase();
   const weakSignals = guardrails.severe_momentum || guardrails.selling_pressure;
+  const riskProfile = resolveSectorRiskProfile(sector);
   const capCandidates = [];
-  if(Number.isFinite(current)) capCandidates.push(current * 1.35);
-  if(Number.isFinite(consensusAvg)) capCandidates.push(consensusAvg * 1.25);
+  if(Number.isFinite(current)) capCandidates.push(current * riskProfile.max_up);
+  if(Number.isFinite(consensusAvg)) capCandidates.push(consensusAvg * riskProfile.consensus_up);
   if(weakSignals && Number.isFinite(current)) capCandidates.push(current * WEAK_SIGNAL_TARGET_CAP);
+  const stance = classifyRecommendation(analysis.action.rating);
+  if(stance === 'bearish' && Number.isFinite(current)){
+    const sellCaps = [];
+    sellCaps.push(current * riskProfile.bearish_cap);
+    if(Number.isFinite(consensusAvg)) sellCaps.push(consensusAvg * riskProfile.bearish_consensus_cap);
+    const filteredSellCaps = sellCaps.filter(val=>Number.isFinite(val) && val>0);
+    if(filteredSellCaps.length){
+      capCandidates.push(Math.min(...filteredSellCaps));
+    }
+  }
   const maxCap = capCandidates.length ? Math.min(...capCandidates.filter(val=>Number.isFinite(val) && val>0)) : null;
-  const minCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_FLOOR : LLM_TARGET_MIN_MULTIPLIER);
+  const minCap = current * (weakSignals ? WEAK_SIGNAL_TARGET_FLOOR : riskProfile.min_down);
   let adjusted = target;
   let clamped = false;
   if(maxCap && adjusted > maxCap){
@@ -1420,6 +1512,12 @@ function adjustRatingForSignals(analysis, { priceMeta, guardrails, momentum }={}
       updateRating('BUY', `動能偏強（${score}分）且目標價具 8% 以上上行空間`);
     }
   }
+  if(momentum?.trend === 'down' && stance === 'bullish'){
+    updateRating('HOLD', '趨勢走弱，暫不建議追價');
+  }
+  if(momentum?.trend === 'up' && stance === 'bearish' && score!=null && score >= 55){
+    updateRating('HOLD', '趨勢翻多，撤回賣出建議');
+  }
   if(severe && stance === 'bullish'){
     updateRating('HOLD', '動能或籌碼偏弱，自動調降評級');
   }
@@ -1444,7 +1542,7 @@ function adjustRatingForSignals(analysis, { priceMeta, guardrails, momentum }={}
   }
 }
 
-function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analystMetrics, momentum, institutional, news, earningsCall, macro, valuation, signalHints, guardrails }){
+function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analystMetrics, momentum, institutional, news, earningsCall, macro, valuation, signalHints, guardrails, sectorProfile }){
   const filingSummaries = Array.isArray(filings)
     ? filings.slice(0, MAX_FILINGS_FOR_LLM).map(entry=>({
         form: entry.form,
@@ -1481,6 +1579,10 @@ function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analyst
     yield_10y: toFloat(macro.yield_10y ?? macro.yields?.y10 ?? macro.yields?.yield10),
     event_note: Array.isArray(macro.events) && macro.events.length ? macro.events[0].event : null
   } : null;
+  const sectorSummary = sectorProfile ? {
+    sector: sectorProfile.sector || null,
+    industry: sectorProfile.industry || null
+  } : null;
 
   return {
     company: ticker,
@@ -1495,6 +1597,7 @@ function buildNumericPayload({ ticker, baselineDate, filings, priceMeta, analyst
     earnings_call: earningsSummary,
     macro: macroSummary,
     valuation: valuation || null,
+    sector: sectorSummary,
     signal_hints: signalHints || null,
     guardrails: guardrails || null
   };
@@ -2142,8 +2245,26 @@ async function performAnalysis(ticker, date, opts={}){
       return null;
     }
   })();
+  const sectorProfilePromise = (async ()=>{
+    if(!FMP_KEY) return null;
+    const cacheKey = `fmp_profile_${upperTicker}`;
+    const cached = await readCache(cacheKey, 7 * DAY_MS);
+    if(cached) return cached;
+    try{
+      const row = await getFmpProfile(upperTicker, FMP_KEY);
+      const profile = {
+        sector: row.sector || null,
+        industry: row.industry || null
+      };
+      await writeCache(cacheKey, profile);
+      return profile;
+    }catch(err){
+      console.warn('[FMP profile]', err.message);
+      return null;
+    }
+  })();
 
-  const [finnhubSnapshot, newsCompact, momentum, institutional, earningsCall, analystSignals, macroInsights, finnhubMetrics] = await Promise.all([
+  const [finnhubSnapshot, newsCompact, momentum, institutional, earningsCall, analystSignals, macroInsights, finnhubMetrics, sectorProfile] = await Promise.all([
     finnhubPromise,
     newsPromise,
     momentumPromise,
@@ -2151,7 +2272,8 @@ async function performAnalysis(ticker, date, opts={}){
     earningsCallPromise,
     analystSignalsPromise,
     macroPromise,
-    finnhubMetricsPromise
+    finnhubMetricsPromise,
+    sectorProfilePromise
   ]);
 
   const priceMeta = finnhubSnapshot?.price_meta || {
@@ -2181,7 +2303,8 @@ async function performAnalysis(ticker, date, opts={}){
     macro: macroInsights,
     valuation: valuationSummary,
     signalHints,
-    guardrails
+    guardrails,
+    sectorProfile
   });
   let llm = null;
   let llmUsage = null;
@@ -2199,7 +2322,7 @@ async function performAnalysis(ticker, date, opts={}){
     llmUsage = llm?.__usage || null;
     if(llmUsage) recordUsage(llmUsage);
     blendTargetWithConsensus(llm, consensusAvg, priceMeta?.value);
-    applyTargetPriceGuardrails(llm, priceMeta, guardrails, { consensusAvg });
+    applyTargetPriceGuardrails(llm, priceMeta, guardrails, { consensusAvg, sector: sectorProfile?.sector });
   }
   if(llm){
     applySmallCapGuardrail(llm, priceMeta);
