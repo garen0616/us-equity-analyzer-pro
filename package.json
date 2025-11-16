@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "node --env-file=.env server.js",
     "start": "node server.js",
+    "test:target": "node scripts/selftestTarget.js",
     "clean:data": "node scripts/cleanData.js",
     "start:clean": "npm run clean:data && npm run start",
     "test:self": "node scripts/selftest.js"
