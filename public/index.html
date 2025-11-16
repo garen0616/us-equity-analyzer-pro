@@ -91,8 +91,8 @@ canvas{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10
     </div>
     <div class="kpis">
       <div class="kpi"><h3>現價</h3><p id="px">-</p></div>
-      <div class="kpi"><h3>未來7天預期漲跌</h3><p id="ptRange">-</p></div>
-      <div class="kpi"><h3>未來30天預期漲跌</h3><p id="ptRange30d">-</p></div>
+      <div class="kpi"><h3>LLM 目標價</h3><p id="ptTarget">-</p></div>
+      <div class="kpi"><h3>目標價相對現價</h3><p id="ptTargetDelta">-</p></div>
       <div class="kpi"><h3>建議</h3><p id="rating">-</p></div>
       <div class="kpi"><h3>類型</h3><p id="segment">-</p></div>
       <div class="kpi"><h3>個股體質分數</h3><p id="qualityScore">-</p></div>
@@ -522,12 +522,19 @@ function setKPIs(quote, pt, priceMeta, action, profile, news, momentum, analystM
   const priceLabel = last? ('$'+last.toFixed(2)) : '-';
   const metaLabel = formatPriceMeta(priceMeta);
   document.getElementById('px').textContent = metaLabel ? `${priceLabel}（${metaLabel}）` : priceLabel;
-  const shortTermLabel = formatHorizonView(action, last, '7d');
-  const midTermLabel = formatHorizonView(action, last, '30d');
-  document.getElementById('ptRange').textContent = shortTermLabel || '-';
-  const ptRange30dEl = document.getElementById('ptRange30d');
-  if(ptRange30dEl){
-    ptRange30dEl.textContent = midTermLabel || '-';
+  const targetEl = document.getElementById('ptTarget');
+  const targetDeltaEl = document.getElementById('ptTargetDelta');
+  const llmTarget = toNum(action?.target_price);
+  if(targetEl){
+    targetEl.textContent = llmTarget!=null ? `$${llmTarget.toFixed(2)}` : '-';
+  }
+  if(targetDeltaEl){
+    if(last && llmTarget!=null){
+      const diff = (llmTarget / last) - 1;
+      targetDeltaEl.textContent = formatDeltaPercent(diff);
+    }else{
+      targetDeltaEl.textContent = '-';
+    }
   }
   const ratingRaw = typeof action?.rating==='string' ? action.rating : '';
   const ratingMap = { BUY:'買進', HOLD:'觀望', SELL:'賣出' };
